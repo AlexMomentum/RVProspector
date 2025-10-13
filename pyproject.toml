@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rvprospector"
+version = "0.1.0"
+description = "Generate daily call lists of off-market RV parks (no online booking). Preserves notes in Excel."
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Alexander Ruiz"}]
+requires-python = ">=3.9"
+dependencies = [
+  "requests>=2.28",
+  "pandas>=2.0",
+  "python-dotenv>=1.0",
+  "XlsxWriter>=3.0"
+]
+
+[project.scripts]
+rvprospector = "rvprospector.cli:main"
+
