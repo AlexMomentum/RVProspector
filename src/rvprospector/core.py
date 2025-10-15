@@ -1,49 +1,50 @@
 import os
-import time
 import re
-import pandas as pd
+import time
+from pathlib import Path
 from datetime import date, datetime
 from urllib.parse import urljoin
+
+import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter, Retry
 from dotenv import dotenv_values
 
-# ---------------- Env key management ----------------
+# =======================
+#   ENV / CONFIG HELPERS
+# =======================
 
-def _user_env_dir():
-    # cross-platform: %USERPROFILE% on Windows, $HOME on Unix
-    home = os.path.expanduser("~")
-    path = os.path.join(home, ".rvprospector")
-    os.makedirs(path, exist_ok=True)
+def _user_env_dir() -> Path:
+    """Cross-platform place to hold user config (.env)."""
+    home = Path.home()
+    path = home / ".rvprospector"
+    path.mkdir(parents=True, exist_ok=True)
     return path
 
 def _candidate_env_paths():
     # 1) current working dir .env
     # 2) user profile config dir ~/.rvprospector/.env
-    return [os.path.join(os.getcwd(), ".env"),
-            os.path.join(_user_env_dir(), ".env")]
+    return [Path.cwd() / ".env", _user_env_dir() / ".env"]
 
-def load_api_key():
+def load_api_key() -> str:
     """
-    Returns GOOGLE_PLACES_API_KEY if present in:
-    1) current working dir .env, or
-    2) ~/.rvprospector/.env
-    or the environment.
+    Returns GOOGLE_PLACES_API_KEY from:
+    - environment var (wins)
+    - ./ .env
+    - ~/.rvprospector/.env
     """
-    # environment var wins
     env_key = os.getenv("GOOGLE_PLACES_API_KEY", "").strip()
     if env_key:
         return env_key
-
     for p in _candidate_env_paths():
-        if os.path.exists(p):
-            vals = dotenv_values(p)
+        if p.exists():
+            vals = dotenv_values(str(p))
             key = (vals.get("GOOGLE_PLACES_API_KEY") or "").strip()
             if key:
                 return key
     return ""
 
-def save_api_key(key: str, prefer="user"):
+def save_api_key(key: str, prefer: str = "user"):
     """
     Persist the API key to an .env:
     prefer="user" -> ~/.rvprospector/.env (default)
@@ -52,19 +53,11 @@ def save_api_key(key: str, prefer="user"):
     key = (key or "").strip()
     if not key:
         return
-
-    if prefer == "cwd":
-        env_path = _candidate_env_paths()[0]
-    else:
-        env_path = _candidate_env_paths()[1]
-
+    env_path = _candidate_env_paths()[0] if prefer == "cwd" else _candidate_env_paths()[1]
     lines = []
-    if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-
-    out = []
-    replaced = False
+    if env_path.exists():
+        lines = env_path.read_text(encoding="utf-8").splitlines(True)
+    out, replaced = [], False
     for line in lines:
         if line.strip().startswith("GOOGLE_PLACES_API_KEY="):
             out.append(f"GOOGLE_PLACES_API_KEY={key}\n")
@@ -73,11 +66,52 @@ def save_api_key(key: str, prefer="user"):
             out.append(line)
     if not replaced:
         out.append(f"GOOGLE_PLACES_API_KEY={key}\n")
+    env_path.write_text("".join(out), encoding="utf-8")
 
-    with open(env_path, "w", encoding="utf-8") as f:
-        f.writelines(out)
+# =======================
+#       DATA FOLDER
+# =======================
 
-# ---------------- Core config ----------------
+def _user_data_dir() -> Path:
+    """Writable data dir for CSV/XLSX/History (macOS-safe)."""
+    home = Path.home()
+    if os.name == "nt":
+        return home / ".rvprospector"
+    else:
+        return home / "Library" / "Application Support" / "RVProspector"
+
+DATA_DIR = _user_data_dir()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+DAILY_CSV   = DATA_DIR / "rv_parks_daily_list.csv"
+HISTORY_CSV = DATA_DIR / "rv_parks_history.csv"
+DAILY_XLSX  = DATA_DIR / "rv_parks_daily_list.xlsx"
+
+def _maybe_migrate_old_files():
+    """
+    One-time migration of files that might exist in the working directory.
+    If a target file already exists in DATA_DIR, it is not overwritten.
+    """
+    candidates = [
+        ("rv_parks_daily_list.csv", DAILY_CSV),
+        ("rv_parks_history.csv",   HISTORY_CSV),
+        ("rv_parks_daily_list.xlsx", DAILY_XLSX),
+    ]
+    for name, target in candidates:
+        old = Path.cwd() / name
+        if old.exists() and not target.exists():
+            try:
+                target.write_bytes(old.read_bytes())
+                # old.unlink(missing_ok=True)  # uncomment if you want originals removed
+                print(f"[info] Migrated {name} → {target}")
+            except Exception as e:
+                print(f"[warn] Could not migrate {name}: {e}")
+
+_maybe_migrate_old_files()
+
+# =======================
+#       CONSTANTS
+# =======================
 
 TARGET_QUERIES = ["RV park", "RV campground", "RV resort", "campground park"]
 DEFAULT_DAILY_TARGET = 10
@@ -89,10 +123,6 @@ READ_TIMEOUT = 10
 GOOGLE_TIMEOUT = 15
 SUBPAGE_LIMIT = 6
 TOTAL_SITE_FETCH_TIMEOUT = 18.0
-
-DAILY_CSV = "rv_parks_daily_list.csv"
-HISTORY_CSV = "rv_parks_history.csv"
-DAILY_XLSX = "rv_parks_daily_list.xlsx"
 
 BOOKING_KEYWORDS = [
     "campspot", "resnexus", "rezhub", "rezstream", "rmscloud", "rms bookings",
@@ -115,47 +145,21 @@ COMMON_COLS = [
     "detected_keyword","pad_count","notes","call_status","outcome","follow_up_date"
 ]
 
-
-# --- Conglomerate filtering ---
+# Conglomerate filtering (optional)
 CONGLOMERATE_KEYWORDS = [
-    # brands/groups to skip (name or website contains)
     "koa.com", "kampgrounds of america", "koa ",
     "thousandtrails", "thousand trails", "encore rv", "encore rv resorts",
     "sunoutdoors", "sun outdoors", "equity lifestyle", "equity lifestyles",
     "els rv", "rvonthego.com", "rvc outdoors", "bluewater", "yogi bear",
     "jellystone", "yogi bear’s jellystone", "disney fort wilderness"
 ]
-
 def _is_conglomerate(name: str, website: str) -> bool:
     s = f"{(name or '').lower()} {(website or '').lower()}"
     return any(k in s for k in CONGLOMERATE_KEYWORDS)
 
-# --- Approx "near me" via IP (best-effort) ---
-def get_approx_location_via_ip(timeout=5.0):
-    """
-    Returns (lat, lng) floats or None if not available.
-    Uses ipapi.co (no key); fallback to ipinfo.io if needed.
-    """
-    try:
-        r = requests.get("https://ipapi.co/json", timeout=timeout)
-        if r.ok:
-            j = r.json()
-            lat, lon = float(j.get("latitude")), float(j.get("longitude"))
-            if lat and lon:
-                return (lat, lon)
-    except Exception:
-        pass
-    try:
-        r = requests.get("https://ipinfo.io/json", timeout=timeout)
-        if r.ok:
-            j = r.json()
-            loc = j.get("loc", "")
-            if "," in loc:
-                lat, lon = loc.split(",", 1)
-                return (float(lat), float(lon))
-    except Exception:
-        pass
-    return None
+# =======================
+#     HTTP / GOOGLE API
+# =======================
 
 def make_session():
     s = requests.Session()
@@ -163,7 +167,7 @@ def make_session():
         total=3,
         backoff_factor=0.5,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"]
+        allowed_methods=["GET"],
     )
     adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
     s.mount("http://", adapter)
@@ -173,10 +177,11 @@ def make_session():
 
 session = make_session()
 
-def ensure_csv(path, columns):
-    if not os.path.exists(path):
+def ensure_csv(path: Path, columns):
+    if not path.exists():
         pd.DataFrame(columns=columns).to_csv(path, index=False)
 
+# bootstrap files
 ensure_csv(DAILY_CSV, COMMON_COLS)
 ensure_csv(HISTORY_CSV, [
     "park_place_id","park_name","website","phone","address","city","state","zip",
@@ -184,8 +189,6 @@ ensure_csv(HISTORY_CSV, [
 ])
 
 history_df = pd.read_csv(HISTORY_CSV, dtype=str)
-
-# ---------------- Helpers ----------------
 
 def _sanitize_url(u: str) -> str:
     if u is None:
@@ -199,8 +202,8 @@ def _sanitize_url(u: str) -> str:
 
 def google_text_search(api_key, query, location_bias=None, pagetoken=None, latlng=None, radius_m=50000):
     """
-    If latlng=(lat,lng) is provided, uses 'location' + 'radius' for better 'near me' results.
-    Otherwise falls back to 'query near {location_bias}'.
+    If latlng=(lat,lng) is provided, use 'location' + 'radius' (near me mode).
+    Else 'query near {location_bias}'.
     """
     url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
     params = {"key": api_key}
@@ -211,7 +214,7 @@ def google_text_search(api_key, query, location_bias=None, pagetoken=None, latln
         if latlng:
             lat, lng = latlng
             params["location"] = f"{lat},{lng}"
-            params["radius"] = str(radius_m)   # ~50km default; adjust if you want tighter/wider
+            params["radius"] = str(radius_m)
         elif location_bias:
             params["query"] = f"{query} near {location_bias}"
     resp = session.get(url, params=params, timeout=(CONNECT_TIMEOUT, GOOGLE_TIMEOUT))
@@ -221,7 +224,6 @@ def google_text_search(api_key, query, location_bias=None, pagetoken=None, latln
     if status not in ("OK", "ZERO_RESULTS"):
         raise SystemExit(f"Google Text Search error: {status} — {data.get('error_message')}")
     return data
-
 
 def google_place_details(api_key, place_id):
     url = "https://maps.googleapis.com/maps/api/place/details/json"
@@ -265,6 +267,7 @@ def extract_pad_count(html):
     return None
 
 def check_booking_and_pads(website):
+    """Return (no_booking_detected, booking_keyword, pad_count)."""
     if not website:
         return (True, "", None)
     start = time.time()
@@ -309,12 +312,12 @@ def append_history_entry(entry):
 
 def read_existing_authoritative():
     df = pd.DataFrame(columns=COMMON_COLS)
-    if os.path.exists(DAILY_XLSX):
+    if DAILY_XLSX.exists():
         try:
             df = pd.read_excel(DAILY_XLSX, dtype=str).fillna("")
         except Exception:
             pass
-    if df.empty and os.path.exists(DAILY_CSV):
+    if df.empty and DAILY_CSV.exists():
         try:
             df = pd.read_csv(DAILY_CSV, dtype=str).fillna("")
         except Exception:
@@ -342,17 +345,17 @@ def merge_preserving_notes(existing_df: pd.DataFrame, new_rows: list) -> pd.Data
     combined = combined[COMMON_COLS].astype(str).fillna("")
     return combined.reset_index(drop=True)
 
-def _write_xlsx(df, target_path, website_col="website"):
+def _write_xlsx(df: pd.DataFrame, target_path: Path, website_col="website"):
     with pd.ExcelWriter(target_path, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="Daily List")
         ws = writer.sheets["Daily List"]
         if website_col in df.columns:
             col_idx = df.columns.get_loc(website_col)
             for r, url in enumerate(df[website_col], start=1):
-                if url:
+                if isinstance(url, str) and url.startswith(("http://", "https://")):
                     ws.write_url(r, col_idx, url, string=url)
 
-def safe_write_xlsx(df, path, website_col="website", max_retries=5):
+def safe_write_xlsx(df, path: Path, website_col="website", max_retries=5):
     df = df.copy()
     if website_col in df.columns:
         df[website_col] = df[website_col].apply(_sanitize_url)
@@ -363,7 +366,7 @@ def safe_write_xlsx(df, path, website_col="website", max_retries=5):
         except PermissionError:
             if attempt == max_retries:
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                alt = f"{os.path.splitext(path)[0]}_{ts}.xlsx"
+                alt = path.with_stem(f"{path.stem}_{ts}")
                 _write_xlsx(df, alt, website_col)
                 print(f"[warn] {path} locked (Excel/OneDrive?). Wrote fallback: {alt}")
                 return alt
@@ -376,9 +379,36 @@ def write_outputs_preserving(existing_df: pd.DataFrame, daily_rows: list):
     history_df.to_csv(HISTORY_CSV, index=False)
     return combined
 
-# ---------------- Main engine ----------------
+# =======================
+#    NEAR ME (IP GEO)
+# =======================
 
-# ---------------- Main engine ----------------
+def get_approx_location_via_ip(timeout=5.0):
+    """Returns (lat, lng) or None via public IP services."""
+    try:
+        r = requests.get("https://ipapi.co/json", timeout=timeout)
+        if r.ok:
+            j = r.json()
+            lat, lon = float(j.get("latitude")), float(j.get("longitude"))
+            if lat and lon:
+                return (lat, lon)
+    except Exception:
+        pass
+    try:
+        r = requests.get("https://ipinfo.io/json", timeout=timeout)
+        if r.ok:
+            j = r.json()
+            loc = j.get("loc", "")
+            if "," in loc:
+                lat, lon = loc.split(",", 1)
+                return (float(lat), float(lon))
+    except Exception:
+        pass
+    return None
+
+# =======================
+#     MAIN ENGINE
+# =======================
 
 def generate_daily(api_key: str,
                    location_bias: str,
@@ -386,8 +416,8 @@ def generate_daily(api_key: str,
                    avoid_conglomerates: bool = True,
                    near_me: bool = True,
                    radius_m: int = 50000,
-                   progress_fn=None):   # <— NEW (optional)
-    # simple event emitter
+                   progress_fn=None):
+    """Core generator. Optionally emits progress via progress_fn(str)."""
     def emit(msg: str):
         try:
             if progress_fn:
@@ -423,7 +453,6 @@ def generate_daily(api_key: str,
                 latlng=latlng if near_me else None,
                 radius_m=radius_m
             )
-
             results = data.get("results", [])
             token = data.get("next_page_token")
             page_num += 1
@@ -437,6 +466,7 @@ def generate_daily(api_key: str,
                 pid = r.get("place_id")
                 if not pid or already_seen(pid):
                     continue
+
                 checked += 1
                 name_preview = r.get("name", "")
                 emit(f"    [check {checked}/{MAX_RESULTS_TO_CHECK}] {name_preview}")
@@ -449,12 +479,13 @@ def generate_daily(api_key: str,
                 comps = {"city":"", "state":"", "zip":""}
                 for comp in det.get("address_components", []) or []:
                     types = comp.get("types", [])
-                    if "locality" in types:  comps["city"] = comp.get("long_name","")
-                    if "administrative_area_level_1" in types:  comps["state"] = comp.get("short_name","")
-                    if "postal_code" in types:  comps["zip"] = comp.get("long_name","")
+                    if "locality" in types: comps["city"] = comp.get("long_name","")
+                    if "administrative_area_level_1" in types: comps["state"] = comp.get("short_name","")
+                    if "postal_code" in types: comps["zip"] = comp.get("long_name","")
 
-                # (optional) conglomerate skip here if you added it
-                # if avoid_conglomerates and _is_conglomerate(name, website): ... continue
+                if avoid_conglomerates and _is_conglomerate(name, website):
+                    emit(f"      [skip] {name} (appears to be a chain)")
+                    continue
 
                 no_booking, booking_hit, pad_count = check_booking_and_pads(website)
                 qualifies = no_booking and (pad_count is None or pad_count >= PAD_MIN)
@@ -490,4 +521,3 @@ def generate_daily(api_key: str,
     if len(found) < daily_target:
         emit("[tip] Increase RV_MAX_CHECKS, broaden location, or add more queries.")
         emit("[note] Pad counts are inferred heuristically; confirm on the call.")
-
