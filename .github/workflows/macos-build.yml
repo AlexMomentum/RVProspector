@@ -17,6 +17,8 @@ jobs:
             arch_label: mac_apple_silicon
 
     runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
 
     steps:
       - name: Checkout
@@ -26,6 +28,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install deps (project + runtime + packager)
         run: |
@@ -36,6 +39,10 @@ jobs:
       - name: Clean
         run: |
           rm -rf build dist "RV Prospector.spec"
+
+      - name: Smoke test
+        run: |
+          python -c "import rvprospector; print('rvprospector import OK')"
 
       - name: Build .app (bundle)
         run: |
@@ -48,6 +55,10 @@ jobs:
             --collect-data xlsxwriter \
             --hidden-import dotenv \
             ./gui_entry.py
+
+      - name: Ad-hoc codesign (optional)
+        run: |
+          codesign --force --deep --sign - "dist/RV Prospector.app" || true
 
       - name: Zip .app
         working-directory: dist
