@@ -259,14 +259,17 @@ def _render_demo_limit_body(sb, cm):
                     si_email = st.text_input("Email", placeholder="you@example.com")
                     si_name = st.text_input("Full name (optional)")
                     si_submit = st.form_submit_button("🔓 Sign Up for Extended Use")
+
                 if si_submit and si_email and "@" in si_email:
                     try:
+                        # 1) Record interest (existing behavior)
                         record_signup(sb, si_email, si_name or None)
 
-                        # NEW: immediately grant unlimited + sign them in
-                        from web.db import grant_unlimited  # or import at top
-                        grant_unlimited(sb, si_email, si_name or None)
-                        _set_signed_in(cm, si_email, True)  # updates session + cookie
+                        # 2) UNLOCK via secure RPC (you created this in SQL with SECURITY DEFINER)
+                        sb.rpc("grant_unlimited", {"p_email": si_email, "p_full_name": si_name or None}).execute()
+
+                        # 3) Sign them in and flip session to Unlimited
+                        _set_signed_in(cm, si_email, True)
 
                         st.success("Thanks! Your account is now Unlimited.")
                         st.rerun()
@@ -280,6 +283,8 @@ def _render_demo_limit_body(sb, cm):
         else:
             st.caption("Set DONATE_URL to show a donate button.")
 
+
+# 2) Update the wrapper to pass `cm`
 def show_demo_limit(sb, cm):
     if hasattr(st, "modal"):
         with st.modal("Daily Demo Limit Reached", max_width=700):
