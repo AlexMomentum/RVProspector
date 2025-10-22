@@ -266,7 +266,8 @@ def _render_demo_limit_body(sb, cm):
                         record_signup(sb, si_email, si_name or None)
 
                         # 2) UNLOCK via secure RPC (you created this in SQL with SECURITY DEFINER)
-                        sb.rpc("grant_unlimited", {"p_email": si_email, "p_full_name": si_name or None}).execute()
+                        from web.db import grant_unlimited
+                        grant_unlimited(sb, si_email, si_name or None)
 
                         # 3) Sign them in and flip session to Unlimited
                         _set_signed_in(cm, si_email, True)
