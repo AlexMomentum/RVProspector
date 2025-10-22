@@ -8,10 +8,33 @@ from typing import Any, Dict, List
 import pandas as pd
 import streamlit as st
 import extra_streamlit_components as stx
+import os
+
+
 
 # --------------------------------------------------------------------------------------
 # Imports setup
 # --------------------------------------------------------------------------------------
+
+
+def _secrets_to_env():
+    # map multiple secret names -> single env var your code reads
+    mappings = {
+        "GOOGLE_PLACES_API_KEY": ["GOOGLE_PLACES_API_KEY", "GOOGLE_MAPS_API_KEY", "GOOGLE_API_KEY"],
+        "SUPABASE_URL":         ["SUPABASE_URL"],
+        "SUPABASE_ANON_KEY":    ["SUPABASE_ANON_KEY"],
+    }
+    for env_name, candidates in mappings.items():
+        if os.getenv(env_name):  # already set (local dev)
+            continue
+        for key in candidates:
+            val = st.secrets.get(key)
+            if val:
+                os.environ[env_name] = str(val)
+                break
+
+_secrets_to_env()
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT / "src"
 if str(ROOT) not in sys.path:
