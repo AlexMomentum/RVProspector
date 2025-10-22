@@ -1,0 +1,33 @@
+# ---- Python / Streamlit ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.sqlite3
+.venv/
+env/
+venv/
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+
+# Data files generated locally
+*.csv
+*.xlsx
+
+# ---- ENV / Secrets (VERY IMPORTANT) ----
+.env
+*.env
+web/.env
+.rvprospector/
