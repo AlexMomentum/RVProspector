@@ -5,6 +5,7 @@ import io
 import os
 import pathlib
 import sys
+import traceback
 import uuid
 from typing import Any, Dict, List
 
@@ -12,43 +13,15 @@ import pandas as pd
 import streamlit as st
 import extra_streamlit_components as stx
 
-# ---- replace your direct import with this block ----
-import traceback
-try:
-    import web.db as db
-except Exception as e:
-    import streamlit as st  # already imported above, but safe
-    st.error(f"Failed to import web.db: {e.__class__.__name__}: {e}")
-    st.code(''.join(traceback.format_exc()))
-    st.stop()
-
-# Then alias what you use:
-fetch_history_place_ids = db.fetch_history_place_ids
-get_client              = db.get_client
-increment_leads         = db.increment_leads
-is_unlocked             = db.is_unlocked
-record_history          = db.record_history
-upsert_profile          = db.upsert_profile
-slice_by_trial          = db.slice_by_trial
-# optional helpers used by the modal
-record_signup           = getattr(db, "record_signup", None)
-grant_unlimited         = getattr(db, "grant_unlimited", None)
-
-
-# ----------- Configurable links (set via env or Streamlit secrets) -----------
-SIGNUP_URL = os.getenv("SIGNUP_URL", "").strip()   # e.g. https://rvprospector.com/pricing
-DONATE_URL = os.getenv("DONATE_URL", "").strip()   # e.g. PayPal / BuyMeACoffee link
-
-
 # -----------------------------------------------------------------------------
 # Secrets -> env (for Streamlit Cloud)
 # -----------------------------------------------------------------------------
 def _secrets_to_env():
     mappings = {
         "GOOGLE_PLACES_API_KEY": ["GOOGLE_PLACES_API_KEY", "GOOGLE_MAPS_API_KEY", "GOOGLE_API_KEY"],
-        "SUPABASE_URL":          ["SUPABASE_URL"],
-        "SUPABASE_ANON_KEY":     ["SUPABASE_ANON_KEY"],
-        "SUPABASE_SERVICE_ROLE_KEY": ["SUPABASE_SERVICE_ROLE_KEY", "SERVICE_ROLE_KEY"],  # <- add SRK
+        "SUPABASE_URL": ["SUPABASE_URL"],
+        "SUPABASE_ANON_KEY": ["SUPABASE_ANON_KEY"],
+        "SUPABASE_SERVICE_ROLE_KEY": ["SUPABASE_SERVICE_ROLE_KEY", "SERVICE_ROLE_KEY"],
     }
     for env_name, candidates in mappings.items():
         if os.getenv(env_name):
@@ -65,26 +38,52 @@ def _secrets_to_env():
 
 _secrets_to_env()
 
-# Make local modules importable when running:  streamlit run web/app.py
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+# -----------------------------------------------------------------------------
+# Path setup so Python can find web/ and src/
+# -----------------------------------------------------------------------------
+ROOT = pathlib.Path(__file__).resolve().parents[1]   # /mount/src/rvprospector
 SRC_DIR = ROOT / "src"
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+WEB_DIR = pathlib.Path(__file__).resolve().parent     # /mount/src/rvprospector/web
 
-from rvprospector import core as c  # noqa: E402
-from web.db import (                # noqa: E402
-    fetch_history_place_ids,
-    get_client,
-    increment_leads,
-    is_unlocked,
-    record_history,
-    upsert_profile,
-    slice_by_trial,
-    record_signup,
-    grant_unlimited,
-)
+for p in (str(ROOT), str(SRC_DIR), str(WEB_DIR)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+# -----------------------------------------------------------------------------
+# Safe import of web.db
+# -----------------------------------------------------------------------------
+try:
+    import web.db as db
+except ModuleNotFoundError:
+    # fallback: load directly from file path if 'web' package not found
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("web.db", WEB_DIR / "db.py")
+    db = importlib.util.module_from_spec(spec)
+
+    import types
+    sys.modules.setdefault("web", types.ModuleType("web"))
+    sys.modules["web.db"] = db
+
+    assert spec.loader is not None
+    spec.loader.exec_module(db)
+except Exception as e:
+    st.error(f"Failed to import web.db: {e.__class__.__name__}: {e}")
+    st.code(''.join(traceback.format_exc()))
+    st.stop()
+
+# Re-export for the rest of app.py
+fetch_history_place_ids = db.fetch_history_place_ids
+get_client              = db.get_client
+increment_leads         = db.increment_leads
+is_unlocked             = db.is_unlocked
+record_history          = db.record_history
+upsert_profile          = db.upsert_profile
+slice_by_trial          = db.slice_by_trial
+record_signup           = getattr(db, "record_signup", None)
+grant_unlimited         = getattr(db, "grant_unlimited", None)
+# -----------------------------------------------------------------------------
+# Continue with the rest of your app.py below this point
+# -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
 # Page config + Sidebar
