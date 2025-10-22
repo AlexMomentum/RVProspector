@@ -132,9 +132,54 @@ def increment_leads(sb: SupabaseClient, email: str, n: int) -> None:
 # -----------------------------
 # History tracking
 # -----------------------------
+
+# --- Daily demo limit (per user_key: email or guest:{uuid})
+DEMO_LIMIT = 10  # same as FREE_LIMIT but per-day
+
+from datetime import datetime, timezone, timedelta
+
+def _utc_bounds_for_today():
+    now = datetime.now(timezone.utc)
+    start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+    end = start + timedelta(days=1)
+    return start.isoformat(), end.isoformat()
+
+def count_leads_today(sb: SupabaseClient, user_key: str) -> int:
+    """How many history rows this user_key created today (UTC)."""
+    start_iso, end_iso = _utc_bounds_for_today()
+    resp = (
+        sb.table(HISTORY)
+        .select("id", count="exact")
+        .eq("email", user_key)
+        .gte("created_at", start_iso)
+        .lt("created_at", end_iso)
+        .execute()
+    )
+    # postgrest-python returns count in resp.count or in resp.data length; prefer resp.count when available
+    return int(getattr(resp, "count", None) or len(resp.data or []))
+
+def slice_by_demo_today(sb: SupabaseClient, user_key: str, requested: int) -> tuple[int, int]:
+    """
+    For demo users (guests or locked accounts), return (allowed, remaining_after).
+    """
+    used_today = count_leads_today(sb, user_key)
+    remaining = max(0, DEMO_LIMIT - used_today)
+    allowed = min(int(requested), remaining)
+    return allowed, remaining
+
 def fetch_history_place_ids(sb: SupabaseClient, email: str) -> Set[str]:
     res = sb.table(HISTORY).select("park_place_id").eq("email", email).execute()
     return {row["park_place_id"] for row in (res.data or []) if row.get("park_place_id")}
+
+def record_signup(sb: SupabaseClient, email: str, full_name: str | None = None) -> None:
+    email = (email or "").strip().lower()
+    if not email:
+        return
+    sb.table("signups").upsert(
+        {"email": email, "full_name": full_name or ""},
+        on_conflict="email"
+    ).execute()
+
 
 
 def record_history(sb: SupabaseClient, email: str, rows: List[Dict[str, Any]]):

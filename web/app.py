@@ -1,3 +1,4 @@
+# web/app.py
 from __future__ import annotations
 import io
 import pathlib
@@ -10,13 +11,12 @@ import streamlit as st
 import extra_streamlit_components as stx
 import os
 
-
+SIGNUP_URL = os.getenv("SIGNUP_URL", "").strip()  # e.g. https://rvprospector.com/pricing
+DONATE_URL = os.getenv("DONATE_URL", "").strip()  # PayPal or BuyMeACoffee link
 
 # --------------------------------------------------------------------------------------
 # Imports setup
 # --------------------------------------------------------------------------------------
-
-
 def _secrets_to_env():
     # map multiple secret names -> single env var your code reads
     mappings = {
@@ -43,7 +43,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from rvprospector import core as c  # noqa: E402
-from web.db import (
+from web.db import (  # noqa: E402
     fetch_history_place_ids,
     get_client,
     increment_leads,
@@ -51,7 +51,9 @@ from web.db import (
     record_history,
     upsert_profile,
     slice_by_trial,
-)  # noqa: E402
+    # make sure this exists in web/db.py (the helper we added earlier)
+    record_signup,
+)
 
 # --------------------------------------------------------------------------------------
 # Page Config + Sidebar
@@ -83,23 +85,6 @@ def _guest_key_from_cookie() -> str:
     return f"guest:{gid}"
 
 # --------------------------------------------------------------------------------------
-# Demo Limit Popup
-# --------------------------------------------------------------------------------------
-@st.dialog("Daily Demo Limit Reached")
-def demo_limit_dialog():
-    st.markdown(
-        """
-**You’ve reached your 10 demo leads for today.**  
-RV Prospector is free to try — you’ll get 10 more leads tomorrow!  
-
-If you’d like unlimited access, please sign up below.  
-Your support keeps this project alive ❤️
-        """
-    )
-    st.link_button("🔓 Sign Up for Extended Use", "https://your-signup-link.example")
-    st.link_button("❤️ Donate via PayPal", "https://www.paypal.com/donate?hosted_button_id=YOUR_BUTTON_ID")
-
-# --------------------------------------------------------------------------------------
 # Location Helper
 # --------------------------------------------------------------------------------------
 US_STATES = {
@@ -127,11 +112,19 @@ def normalize_location(raw: str) -> str:
 # --------------------------------------------------------------------------------------
 # Core Search Function
 # --------------------------------------------------------------------------------------
-def _generate_for_user(api_key: str, email: str, location: str, requested: int, avoid_conglomerates: bool, near_me: bool, radius_m: int = 50_000) -> List[Dict[str, Any]]:
+def _generate_for_user(
+    api_key: str,
+    email: str,
+    location: str,
+    requested: int,
+    avoid_conglomerates: bool,
+    near_me: bool,
+    radius_m: int = 50_000
+) -> List[Dict[str, Any]]:
     sb = get_client()
     already = fetch_history_place_ids(sb, email)
-    seen = set()
-    found = []
+    seen: set[str] = set()
+    found: List[Dict[str, Any]] = []
     checked = 0
 
     def emit(msg: str):
@@ -144,8 +137,6 @@ def _generate_for_user(api_key: str, email: str, location: str, requested: int, 
         if not latlng:
             emit("[warn] Could not auto-detect location from IP; using manual location.")
             near_me = False
-
-    today = pd.Timestamp.today().date().isoformat()
 
     for query in c.TARGET_QUERIES:
         where = "your current area" if near_me else location
@@ -181,9 +172,12 @@ def _generate_for_user(api_key: str, email: str, location: str, requested: int, 
                 comps = {"city": "", "state": "", "zip": ""}
                 for comp in det.get("address_components", []) or []:
                     types = comp.get("types", [])
-                    if "locality" in types: comps["city"] = comp.get("long_name", "")
-                    if "administrative_area_level_1" in types: comps["state"] = comp.get("short_name", "")
-                    if "postal_code" in types: comps["zip"] = comp.get("long_name", "")
+                    if "locality" in types:
+                        comps["city"] = comp.get("long_name", "")
+                    if "administrative_area_level_1" in types:
+                        comps["state"] = comp.get("short_name", "")
+                    if "postal_code" in types:
+                        comps["zip"] = comp.get("long_name", "")
 
                 if avoid_conglomerates and c._is_conglomerate(name, website):
                     seen.add(pid)
@@ -274,7 +268,39 @@ def main():
         allowed, is_unlim, remaining = slice_by_trial(sb, user_key, int(requested))
 
         if not is_unlim and allowed <= 0:
-            demo_limit_dialog()
+            # -------------------- DAILY DEMO LIMIT MODAL --------------------
+            with st.modal("Daily Demo Limit Reached", max_width=700):
+                st.markdown("### **Daily Demo Limit Reached**")
+                st.write(
+                    "You’ve reached your 10 demo leads for today.\n\n"
+                    "RV Prospector is free to try — you’ll get 10 more leads tomorrow!\n\n"
+                    "If you’d like unlimited access, please sign up below.\n"
+                    "Your support keeps this project alive ❤️"
+                )
+
+                cols = st.columns(2)
+                with cols[0]:
+                    if SIGNUP_URL:
+                        st.link_button("🔓 Sign Up for Extended Use", SIGNUP_URL, use_container_width=True)
+                    else:
+                        # Inline capture (no external service)
+                        with st.form("signup_inline", border=False):
+                            si_email = st.text_input("Email", placeholder="you@example.com")
+                            si_name = st.text_input("Full name (optional)")
+                            si_submit = st.form_submit_button("🔓 Sign Up for Extended Use")
+                        if si_submit:
+                            try:
+                                record_signup(sb, si_email, si_name or None)
+                                st.success("Thanks! We’ll reach out shortly.")
+                            except Exception as e:
+                                st.error(f"Could not save signup: {e}")
+
+                with cols[1]:
+                    if DONATE_URL:
+                        st.link_button("💗 Donate via PayPal", DONATE_URL, use_container_width=True)
+                    else:
+                        st.caption("Add DONATE_URL in your environment to enable a donate button.")
+            # ----------------------------------------------------------------
             st.stop()
 
         with st.status("Searching for parks...", expanded=True) as status:
@@ -324,6 +350,7 @@ def main():
 
         with st.expander("Run Log"):
             st.code("\n".join(st.session_state.get("log", [])))
+
 
 if __name__ == "__main__":
     main()
