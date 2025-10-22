@@ -21,7 +21,7 @@ def _secrets_to_env():
         "GOOGLE_PLACES_API_KEY": ["GOOGLE_PLACES_API_KEY", "GOOGLE_MAPS_API_KEY", "GOOGLE_API_KEY"],
         "SUPABASE_URL": ["SUPABASE_URL"],
         "SUPABASE_ANON_KEY": ["SUPABASE_ANON_KEY"],
-        "SUPABASE_SERVICE_ROLE_KEY": ["SUPABASE_SERVICE_ROLE_KEY", "SERVICE_ROLE_KEY"],  # important
+        "SUPABASE_SERVICE_ROLE_KEY": ["SUPABASE_SERVICE_ROLE_KEY", "SERVICE_ROLE_KEY"],  # important if you want to write unlocked=true
         "SIGNUP_URL": ["SIGNUP_URL"],
         "DONATE_URL": ["DONATE_URL"],
     }
@@ -47,12 +47,6 @@ DONATE_URL = os.getenv("DONATE_URL", "").strip()   # e.g. PayPal / BuyMeACoffee 
 # -----------------------------------------------------------------------------
 # Path setup so Python can find web/ and src/
 # -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-# Add local modules to sys.path
-# -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-# Path setup so Python can find web/ and src/
-# -----------------------------------------------------------------------------
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT / "src"
 if str(ROOT) not in sys.path:
@@ -61,17 +55,17 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 # -----------------------------------------------------------------------------
-# ✅ Single, robust import of web.db
+# ✅ Single, robust import of web.db (works whether 'web' is a package or a folder)
 # -----------------------------------------------------------------------------
 def _import_web_db():
-    # First try normal package import
+    # Try normal package import first
     try:
         import web.db as dbmod
         return dbmod
     except Exception:
         pass
 
-    # Fallback: import by file path (works even if 'web' isn't a package)
+    # Fallback: import by file path
     import importlib.util, types
     web_dir = ROOT / "web"
     db_path = web_dir / "db.py"
@@ -119,9 +113,8 @@ if DONATE_URL:
 else:
     st.sidebar.caption("Set DONATE_URL to show a donate button.")
 
-
 # -----------------------------------------------------------------------------
-# Cookie helpers (no get_all() inside helpers; single component instance in main)
+# Cookie helpers
 # -----------------------------------------------------------------------------
 def _ensure_guest_cookie(cm: stx.CookieManager, cookies: Dict[str, str]) -> str:
     """Ensure there is a 'rvp_guest_id' cookie and return the session user_key."""
@@ -131,18 +124,15 @@ def _ensure_guest_cookie(cm: stx.CookieManager, cookies: Dict[str, str]) -> str:
         cm.set("rvp_guest_id", gid)
     return f"guest:{gid}"
 
-
 def _set_signed_in(cm: stx.CookieManager, email: str, unlocked: bool):
     st.session_state["user_key"] = email
     st.session_state["unlocked"] = bool(unlocked)
     cm.set("rvp_email", email)
 
-
 def _sign_out(cm: stx.CookieManager):
     st.session_state.pop("user_key", None)
     st.session_state.pop("unlocked", None)
     cm.delete("rvp_email")
-
 
 # -----------------------------------------------------------------------------
 # Location helpers
@@ -159,7 +149,6 @@ US_STATES = {
     "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming", "DC": "District of Columbia"
 }
 
-
 def normalize_location(raw: str) -> str:
     s = (raw or "").strip()
     if not s:
@@ -169,7 +158,6 @@ def normalize_location(raw: str) -> str:
     if s.title() in US_STATES.values() and "usa" not in s.lower():
         return f"{s.title()}, USA"
     return s
-
 
 # -----------------------------------------------------------------------------
 # Search core
@@ -274,7 +262,6 @@ def _generate_for_user(
 
     return found
 
-
 # -----------------------------------------------------------------------------
 # Demo-limit modal/dialog (version-safe)
 # -----------------------------------------------------------------------------
@@ -296,25 +283,30 @@ def _render_demo_limit_body(sb, cm):
                     si_email = st.text_input("Email", placeholder="you@example.com")
                     si_name = st.text_input("Full name (optional)")
                     si_submit = st.form_submit_button("🔓 Sign Up for Extended Use")
-
                 if si_submit and si_email and "@" in si_email:
                     try:
-                        record_signup(sb, si_email, si_name or None)
-                        grant_unlimited(sb, si_email, si_name or None)  # flips unlocked
+                        if record_signup:
+                            record_signup(sb, si_email, si_name or None)
+                        # Unlock via helper or direct fallback
+                        if grant_unlimited:
+                            grant_unlimited(sb, si_email, si_name or None)
+                        else:
+                            sb.table("profiles").upsert(
+                                {"email": si_email, "full_name": si_name or None, "unlocked": True}
+                            ).execute()
                         _set_signed_in(cm, si_email, True)
                         st.success("Thanks! Your account is now Unlimited.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Could not save signup: {e}")
-
-                    else:
-                        st.caption("Set SIGNUP_URL or implement record_signup() to collect signups here.")
+            else:
+                st.caption("Set SIGNUP_URL or implement record_signup() to collect signups here.")
     with cols[1]:
         if DONATE_URL:
             st.link_button("💗 Donate", DONATE_URL, use_container_width=True)
         else:
             st.caption("Set DONATE_URL to show a donate button.")
-
+    # (Intentionally no Sign out button here; keep modal focused.)
 
 def show_demo_limit(sb, cm):
     if hasattr(st, "modal"):
@@ -326,12 +318,11 @@ def show_demo_limit(sb, cm):
             _render_demo_limit_body(sb, cm)
         _dlg()
 
-
 # -----------------------------------------------------------------------------
 # App
 # -----------------------------------------------------------------------------
 def main():
-    # keep this little debug line for now
+    # quick visibility for whether service role key is present
     st.caption(f"using service key? {'yes' if os.getenv('SUPABASE_SERVICE_ROLE_KEY') else 'no'}")
 
     st.markdown("<h1>🗺️ RV Prospector</h1>", unsafe_allow_html=True)
@@ -348,86 +339,85 @@ def main():
     if cookies is None:
         st.stop()
 
-    # Initialize identity
+    # Initialize identity (restore from cookie or create guest)
     if "user_key" not in st.session_state:
         saved_email = cookies.get("rvp_email")
         if saved_email:
+            # NEVER DOWNGRADE unlocked once True
+            prior = bool(st.session_state.get("unlocked"))
             try:
-                unlocked = is_unlocked(sb, saved_email)
+                unlocked_db = bool(is_unlocked(sb, saved_email))
             except Exception:
-                unlocked = False
+                unlocked_db = False
+            unlocked = prior or unlocked_db
             _set_signed_in(cm, saved_email, unlocked)
         else:
             st.session_state["user_key"] = _ensure_guest_cookie(cm, cookies)
             st.session_state["unlocked"] = False
 
+    # -----------------------------------------------------------------------------
     # Account box
     # -----------------------------------------------------------------------------
-# Account box (drop-in)
-# -----------------------------------------------------------------------------
-with st.expander("🔐 Sign In / Account", expanded=False):
-    is_guest = str(st.session_state["user_key"]).startswith("guest:")
+    with st.expander("🔐 Sign In / Account", expanded=False):
+        is_guest = str(st.session_state["user_key"]).startswith("guest:")
 
-    if is_guest:
-        with st.form("login", border=False):
-            email = st.text_input("Email (optional, for saving your history)")
-            full_name = st.text_input("Full Name (optional)")
-            submitted = st.form_submit_button("Sign In")
+        if is_guest:
+            with st.form("login", border=False):
+                email = st.text_input("Email (optional, for saving your history)")
+                full_name = st.text_input("Full Name (optional)")
+                submitted = st.form_submit_button("Sign In")
 
-        if submitted and email and "@" in email:
-            try:
-                upsert_profile(get_client(), email, full_name or None)
-                unlocked_now = is_unlocked(get_client(), email)
-                _set_signed_in(cm, email, unlocked_now)
-                st.success(f"✅ Signed in as {email} ({'Unlimited' if unlocked_now else 'Demo user'})")
-                st.rerun()
-            except Exception as e:
-                st.warning(f"Login issue: {e}")
-    else:
-        user_email = str(st.session_state["user_key"])
-
-        # Always refresh unlocked from DB on each render
-        try:
-            current_unlocked = bool(is_unlocked(get_client(), user_email))
-        except Exception:
-            current_unlocked = bool(st.session_state.get("unlocked"))
-        _set_signed_in(cm, user_email, current_unlocked)
-
-        st.write(
-            f"Signed in as **{user_email}** "
-            f"({'Unlimited' if st.session_state.get('unlocked') else 'Demo user'})"
-        )
-
-        # 🔓 One-click unlock (service role key recommended)
-        if not st.session_state.get("unlocked"):
-            if st.button("Activate Unlimited"):
+            if submitted and email and "@" in email:
                 try:
-                    upsert_profile(get_client(), user_email, None)
-                    if grant_unlimited:
-                        grant_unlimited(get_client(), user_email, None)
-                    else:
-                        # Fallback: do the upsert directly
-                        get_client().table("profiles").upsert(
-                            {"email": user_email, "unlocked": True}
-                        ).execute()
-
-                    _set_signed_in(cm, user_email, True)
-                    st.success("Unlimited activated for your account.")
+                    upsert_profile(get_client(), email, full_name or None)
+                    unlocked_now = is_unlocked(get_client(), email)
+                    _set_signed_in(cm, email, bool(unlocked_now))
+                    st.success(f"✅ Signed in as {email} ({'Unlimited' if unlocked_now else 'Demo user'})")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Failed to activate unlimited: {e}")
+                    st.warning(f"Login issue: {e}")
+        else:
+            user_email = str(st.session_state["user_key"])
 
-        if st.button("Sign out"):
-            _sign_out(cm)
-            st.rerun()
+            # Always refresh unlocked, but NEVER DOWNGRADE
+            session_unlocked = bool(st.session_state.get("unlocked"))
+            try:
+                db_unlocked = bool(is_unlocked(get_client(), user_email))
+            except Exception:
+                db_unlocked = False
+            current_unlocked = session_unlocked or db_unlocked
+            _set_signed_in(cm, user_email, current_unlocked)
 
+            st.write(
+                f"Signed in as **{user_email}** "
+                f"({'Unlimited' if st.session_state.get('unlocked') else 'Demo user'})"
+            )
 
+            # One-click unlock (uses service role key if configured)
+            if not st.session_state.get("unlocked"):
+                if st.button("Activate Unlimited"):
+                    try:
+                        upsert_profile(get_client(), user_email, None)
+                        if grant_unlimited:
+                            grant_unlimited(get_client(), user_email, None)
+                        else:
+                            get_client().table("profiles").upsert(
+                                {"email": user_email, "unlocked": True}
+                            ).execute()
+                        _set_signed_in(cm, user_email, True)
+                        st.success("Unlimited activated for your account.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to activate unlimited: {e}")
 
+            if st.button("Sign out"):
+                _sign_out(cm)
+                st.rerun()
 
     # API key (from env/secrets)
     api_key = c.load_api_key()
     if not api_key:
-        st.error("Server misconfigured: missing API key.")
+        st.error("Server misconfigured: missing Google API key.")
         st.stop()
 
     st.divider()
@@ -480,7 +470,6 @@ with st.expander("🔐 Sign In / Account", expanded=False):
 
         # ---------------------- Clean display ----------------------
         df = pd.DataFrame(rows)
-
         if "park_place_id" in df.columns:
             df = df.drop(columns=["park_place_id"])
 
