@@ -22,6 +22,8 @@ def _secrets_to_env():
         "SUPABASE_URL": ["SUPABASE_URL"],
         "SUPABASE_ANON_KEY": ["SUPABASE_ANON_KEY"],
         "SUPABASE_SERVICE_ROLE_KEY": ["SUPABASE_SERVICE_ROLE_KEY", "SERVICE_ROLE_KEY"],
+        "SIGNUP_URL": ["SIGNUP_URL"],
+        "DONATE_URL": ["DONATE_URL"],
     }
     for env_name, candidates in mappings.items():
         if os.getenv(env_name):
@@ -35,27 +37,33 @@ def _secrets_to_env():
                 os.environ[env_name] = str(val)
                 break
 
-
 _secrets_to_env()
+
+# ----------- Configurable links (must exist before sidebar uses them) ----------
+SIGNUP_URL = os.getenv("SIGNUP_URL", "").strip()   # e.g. https://rvprospector.com/pricing
+DONATE_URL = os.getenv("DONATE_URL", "").strip()   # e.g. PayPal / BuyMeACoffee link
 
 # -----------------------------------------------------------------------------
 # Path setup so Python can find web/ and src/
 # -----------------------------------------------------------------------------
-ROOT = pathlib.Path(__file__).resolve().parents[1]   # /mount/src/rvprospector
+ROOT = pathlib.Path(__file__).resolve().parents[1]   # /.../rvprospector
 SRC_DIR = ROOT / "src"
-WEB_DIR = pathlib.Path(__file__).resolve().parent     # /mount/src/rvprospector/web
+WEB_DIR = pathlib.Path(__file__).resolve().parent     # /.../rvprospector/web
 
 for p in (str(ROOT), str(SRC_DIR), str(WEB_DIR)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+# Import your core only AFTER paths are set
+from rvprospector import core as c  # noqa: E402
+
 # -----------------------------------------------------------------------------
-# Safe import of web.db
+# Safe import of web.db (gives readable error instead of redacted blob)
 # -----------------------------------------------------------------------------
 try:
     import web.db as db
 except ModuleNotFoundError:
-    # fallback: load directly from file path if 'web' package not found
+    # Fallback: load directly from file path if 'web' package not found
     import importlib.util
     spec = importlib.util.spec_from_file_location("web.db", WEB_DIR / "db.py")
     db = importlib.util.module_from_spec(spec)
@@ -81,9 +89,7 @@ upsert_profile          = db.upsert_profile
 slice_by_trial          = db.slice_by_trial
 record_signup           = getattr(db, "record_signup", None)
 grant_unlimited         = getattr(db, "grant_unlimited", None)
-# -----------------------------------------------------------------------------
-# Continue with the rest of your app.py below this point
-# -----------------------------------------------------------------------------
+
 
 # -----------------------------------------------------------------------------
 # Page config + Sidebar
