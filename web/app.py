@@ -362,44 +362,44 @@ def main():
                 except Exception as e:
                     st.warning(f"Login issue: {e}")
                 else:
-        user_email = str(st.session_state["user_key"])
+                    user_email = str(st.session_state["user_key"])
 
-        # Always refresh unlocked flag from DB each render
-        try:
-            current_unlocked = is_unlocked(get_client(), user_email)
-        except Exception:
-            current_unlocked = bool(st.session_state.get("unlocked"))
-        _set_signed_in(cm, user_email, bool(current_unlocked))
+                    # Always refresh unlocked flag from DB each render
+                    try:
+                        current_unlocked = is_unlocked(get_client(), user_email)
+                    except Exception:
+                        current_unlocked = bool(st.session_state.get("unlocked"))
+                    _set_signed_in(cm, user_email, bool(current_unlocked))
 
-        st.write(
-            f"Signed in as **{user_email}** "
-            f"({'Unlimited' if st.session_state.get('unlocked') else 'Demo user'})"
-        )
+                    st.write(
+                        f"Signed in as **{user_email}** "
+                        f"({'Unlimited' if st.session_state.get('unlocked') else 'Demo user'})"
+                    )
 
-        # 🔓 One-click unlock using service key (if present)
-        if not st.session_state.get("unlocked"):
-            if st.button("Activate Unlimited"):
-                try:
-                    # ensure the profile row exists
-                    upsert_profile(get_client(), user_email, None)
+                    # 🔓 One-click unlock using service key (if present)
+                    if not st.session_state.get("unlocked"):
+                        if st.button("Activate Unlimited"):
+                            try:
+                                # ensure the profile row exists
+                                upsert_profile(get_client(), user_email, None)
 
-                    # flip unlocked=true (uses service role key if configured)
-                    if grant_unlimited:
-                        grant_unlimited(get_client(), user_email, None)
-                    else:
-                        get_client().table("profiles").upsert(
-                            {"email": user_email, "unlocked": True}
-                        ).execute()
+                                # flip unlocked=true (uses service role key if configured)
+                                if grant_unlimited:
+                                    grant_unlimited(get_client(), user_email, None)
+                                else:
+                                    get_client().table("profiles").upsert(
+                                        {"email": user_email, "unlocked": True}
+                                    ).execute()
 
-                    _set_signed_in(cm, user_email, True)
-                    st.success("Unlimited activated for your account.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Failed to activate unlimited: {e}")
+                                _set_signed_in(cm, user_email, True)
+                                st.success("Unlimited activated for your account.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed to activate unlimited: {e}")
 
-        if st.button("Sign out"):
-            _sign_out(cm)
-            st.rerun()
+                    if st.button("Sign out"):
+                        _sign_out(cm)
+                        st.rerun()
 
 
 
