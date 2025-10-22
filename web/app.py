@@ -80,16 +80,16 @@ else:
 
 
 # -----------------------------------------------------------------------------
-# Cookie helpers (NO component construction here)
+# Cookie helpers (no get_all() inside helpers; single component instance in main)
 # -----------------------------------------------------------------------------
-def _guest_key_from_cookie(cm: stx.CookieManager) -> str:
-    cookies = cm.get_all()
-    if cookies is None:
-        st.stop()  # wait for first render pass
+def _ensure_guest_cookie(cm: stx.CookieManager, cookies: Dict[str, str]) -> str:
+    """Ensure there is a 'rvp_guest_id' cookie and return the session user_key."""
     gid = cookies.get("rvp_guest_id")
     if not gid:
         gid = str(uuid.uuid4())
         cm.set("rvp_guest_id", gid)
+        # Optional: force a rerun so the new cookie is available next pass
+        # st.rerun()
     return f"guest:{gid}"
 
 
@@ -291,19 +291,19 @@ def main():
     st.caption("Find RV parks without online booking — Demo gives you 10 new leads per day.")
 
     # Create exactly ONE CookieManager component with a unique key
-    if "cookie_manager" not in st.session_state:
-        st.session_state["cookie_manager"] = stx.CookieManager(key="rvp_cookies")
-    cm: stx.CookieManager = st.session_state["cookie_manager"]
+    cm = stx.CookieManager(key="rvp_cookies")
 
     sb = get_client()
     st.session_state.setdefault("log", [])
 
-    # Initialize identity: restore from cookie or create guest
+    # Fetch cookies ONCE per run
     cookies = cm.get_all()
     if cookies is None:
-        st.stop()
+        st.stop()  # first render pass; cookie manager will populate next run
+
+    # Initialize identity: restore from cookie or create guest (no extra get_all calls)
     if "user_key" not in st.session_state:
-        saved_email = (cookies or {}).get("rvp_email")
+        saved_email = cookies.get("rvp_email")
         if saved_email:
             try:
                 unlocked = is_unlocked(sb, saved_email)
@@ -311,7 +311,7 @@ def main():
                 unlocked = False
             _set_signed_in(cm, saved_email, unlocked)
         else:
-            st.session_state["user_key"] = _guest_key_from_cookie(cm)
+            st.session_state["user_key"] = _ensure_guest_cookie(cm, cookies)
             st.session_state["unlocked"] = False
 
     # Account box
