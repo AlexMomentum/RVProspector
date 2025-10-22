@@ -12,6 +12,29 @@ import pandas as pd
 import streamlit as st
 import extra_streamlit_components as stx
 
+# ---- replace your direct import with this block ----
+import traceback
+try:
+    import web.db as db
+except Exception as e:
+    import streamlit as st  # already imported above, but safe
+    st.error(f"Failed to import web.db: {e.__class__.__name__}: {e}")
+    st.code(''.join(traceback.format_exc()))
+    st.stop()
+
+# Then alias what you use:
+fetch_history_place_ids = db.fetch_history_place_ids
+get_client              = db.get_client
+increment_leads         = db.increment_leads
+is_unlocked             = db.is_unlocked
+record_history          = db.record_history
+upsert_profile          = db.upsert_profile
+slice_by_trial          = db.slice_by_trial
+# optional helpers used by the modal
+record_signup           = getattr(db, "record_signup", None)
+grant_unlimited         = getattr(db, "grant_unlimited", None)
+
+
 # ----------- Configurable links (set via env or Streamlit secrets) -----------
 SIGNUP_URL = os.getenv("SIGNUP_URL", "").strip()   # e.g. https://rvprospector.com/pricing
 DONATE_URL = os.getenv("DONATE_URL", "").strip()   # e.g. PayPal / BuyMeACoffee link
