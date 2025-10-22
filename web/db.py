@@ -38,6 +38,14 @@ UNLIMITED_EMAILS = {"alexmomentum@gmail.com"}  # ✅ Your unlimited user
 PROFILES = "profiles"
 HISTORY = "history"
 
+
+# --- put near your other imports from web.db ---
+try:
+    from web.db import record_signup  # optional
+except Exception:
+    record_signup = None
+
+
 # -----------------------------
 # Supabase client
 # -----------------------------
