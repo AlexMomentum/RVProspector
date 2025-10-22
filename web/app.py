@@ -384,7 +384,7 @@ def main():
         )
 
         if not is_unlim and allowed <= 0:
-            show_demo_limit(sb)
+            show_demo_limit(sb, cm)
             st.stop()
 
         with st.status("Searching for parks...", expanded=True) as status:
