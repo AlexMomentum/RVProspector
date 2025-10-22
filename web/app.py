@@ -11,21 +11,21 @@ import pandas as pd
 import streamlit as st
 import extra_streamlit_components as stx
 
+# Optional marketing links (set in env or Streamlit secrets)
 SIGNUP_URL = os.getenv("SIGNUP_URL", "").strip()   # e.g. https://rvprospector.com/pricing
-DONATE_URL = os.getenv("DONATE_URL", "").strip()   # e.g. PayPal / BuyMeACoffee link
+DONATE_URL = os.getenv("DONATE_URL", "").strip()   # e.g. PayPal / BMC link
 
 # --------------------------------------------------------------------------------------
-# Imports setup
+# Secrets -> Environment (for Streamlit Cloud compatibility)
 # --------------------------------------------------------------------------------------
 def _secrets_to_env():
-    # Map Streamlit Cloud secrets -> environment variables your code reads
     mappings = {
         "GOOGLE_PLACES_API_KEY": ["GOOGLE_PLACES_API_KEY", "GOOGLE_MAPS_API_KEY", "GOOGLE_API_KEY"],
         "SUPABASE_URL":          ["SUPABASE_URL"],
         "SUPABASE_ANON_KEY":     ["SUPABASE_ANON_KEY"],
     }
     for env_name, candidates in mappings.items():
-        if os.getenv(env_name):  # already set (local dev)
+        if os.getenv(env_name):
             continue
         for key in candidates:
             val = st.secrets.get(key)
@@ -35,6 +35,7 @@ def _secrets_to_env():
 
 _secrets_to_env()
 
+# Make project importable: python -m streamlit run web/app.py
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT / "src"
 if str(ROOT) not in sys.path:
@@ -53,14 +54,14 @@ from web.db import (                # noqa: E402
     slice_by_trial,
 )
 
-# make record_signup optional
+# record_signup is optional – only used for inline capture in the modal
 try:
     from web.db import record_signup  # type: ignore
 except Exception:
     record_signup = None  # type: ignore
 
 # --------------------------------------------------------------------------------------
-# Page Config + Sidebar
+# Page config + Sidebar
 # --------------------------------------------------------------------------------------
 st.set_page_config(page_title="RV Prospector (Web)", page_icon="🗺️", layout="centered")
 
@@ -69,10 +70,10 @@ st.sidebar.markdown("If this tool helps you, consider donating to keep it runnin
 if DONATE_URL:
     st.sidebar.link_button("Donate", DONATE_URL)
 else:
-    st.sidebar.caption("Set DONATE_URL to show a donate button.")
+    st.sidebar.caption("Set DONATE_URL in your environment to show a donate button.")
 
 # --------------------------------------------------------------------------------------
-# Cookie Tracking
+# Cookie helpers (guests + “remember me”)
 # --------------------------------------------------------------------------------------
 def _cookie_mgr():
     if "cookie_manager" not in st.session_state:
@@ -83,15 +84,27 @@ def _guest_key_from_cookie() -> str:
     cm = _cookie_mgr()
     cookies = cm.get_all()
     if cookies is None:
-        st.stop()
+        st.stop()  # wait for the rerun
     gid = cookies.get("rvp_guest_id")
     if not gid:
         gid = str(uuid.uuid4())
         cm.set("rvp_guest_id", gid)
     return f"guest:{gid}"
 
+def _set_signed_in(email: str, unlocked: bool):
+    st.session_state["user_key"] = email
+    st.session_state["unlocked"] = bool(unlocked)
+    cm = _cookie_mgr()
+    cm.set("rvp_email", email)  # persist across refreshes
+
+def _sign_out():
+    st.session_state.pop("user_key", None)
+    st.session_state.pop("unlocked", None)
+    cm = _cookie_mgr()
+    cm.delete("rvp_email")
+
 # --------------------------------------------------------------------------------------
-# Location Helper
+# Location helper
 # --------------------------------------------------------------------------------------
 US_STATES = {
     "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas","CA":"California","CO":"Colorado",
@@ -116,7 +129,7 @@ def normalize_location(raw: str) -> str:
     return s
 
 # --------------------------------------------------------------------------------------
-# Core Search Function
+# Core search
 # --------------------------------------------------------------------------------------
 def _generate_for_user(
     api_key: str,
@@ -216,7 +229,7 @@ def _generate_for_user(
     return found
 
 # --------------------------------------------------------------------------------------
-# Version-safe demo-limit popup (uses st.modal if available; else st.dialog)
+# Demo-limit popup (uses st.modal if available, else st.dialog)
 # --------------------------------------------------------------------------------------
 def _render_demo_limit_body(sb):
     st.markdown("### **Daily Demo Limit Reached**")
@@ -226,13 +239,11 @@ def _render_demo_limit_body(sb):
         "If you’d like unlimited access, please sign up below.\n"
         "Your support keeps this project alive ❤️"
     )
-
     cols = st.columns(2)
     with cols[0]:
         if SIGNUP_URL:
             st.link_button("🔓 Sign Up for Extended Use", SIGNUP_URL, use_container_width=True)
         else:
-            # Inline capture if record_signup exists
             if record_signup is not None:
                 with st.form("signup_inline", border=False):
                     si_email = st.text_input("Email", placeholder="you@example.com")
@@ -245,8 +256,7 @@ def _render_demo_limit_body(sb):
                     except Exception as e:
                         st.error(f"Could not save signup: {e}")
             else:
-                st.caption("Add SIGNUP_URL (or implement record_signup) to enable sign-up here.")
-
+                st.caption("Set SIGNUP_URL (or implement record_signup) to enable sign-ups here.")
     with cols[1]:
         if DONATE_URL:
             st.link_button("💗 Donate", DONATE_URL, use_container_width=True)
@@ -264,7 +274,7 @@ def show_demo_limit(sb):
         _dlg()
 
 # --------------------------------------------------------------------------------------
-# Streamlit UI
+# UI
 # --------------------------------------------------------------------------------------
 def main():
     st.markdown("<h1>🗺️ RV Prospector</h1>", unsafe_allow_html=True)
@@ -273,28 +283,47 @@ def main():
     sb = get_client()
     st.session_state.setdefault("log", [])
 
-    # Login
+    # Restore identity from cookie or create guest on first run
+    cm = _cookie_mgr()
+    cookies = cm.get_all()
+    if cookies is None:
+        st.stop()
+    if "user_key" not in st.session_state:
+        saved_email = (cookies or {}).get("rvp_email")
+        if saved_email:
+            try:
+                unlocked = is_unlocked(sb, saved_email)
+            except Exception:
+                unlocked = False
+            _set_signed_in(saved_email, unlocked)
+        else:
+            st.session_state["user_key"] = _guest_key_from_cookie()
+            st.session_state["unlocked"] = False
+
+    # Account box
     with st.expander("🔐 Sign In / Account", expanded=False):
-        with st.form("login", border=False):
-            email = st.text_input("Email (optional, for saving your history)")
-            full_name = st.text_input("Full Name (optional)")
-            submitted = st.form_submit_button("Sign In")
+        if str(st.session_state["user_key"]).startswith("guest:"):
+            with st.form("login", border=False):
+                email = st.text_input("Email (optional, for saving your history)")
+                full_name = st.text_input("Full Name (optional)")
+                submitted = st.form_submit_button("Sign In")
+            if submitted and email and "@" in email:
+                try:
+                    upsert_profile(sb, email, full_name or None)
+                    unlocked = is_unlocked(sb, email)
+                    _set_signed_in(email, unlocked)
+                    st.success(f"✅ Signed in as {email} "
+                               f"({'Unlimited' if unlocked else 'Demo user'})")
+                except Exception as e:
+                    st.warning(f"Login issue: {e}")
+        else:
+            st.write(f"Signed in as **{st.session_state['user_key']}** "
+                     f"({'Unlimited' if st.session_state.get('unlocked') else 'Demo user'})")
+            if st.button("Sign out"):
+                _sign_out()
+                st.rerun()
 
-    if submitted and email and "@" in email:
-        try:
-            profile = upsert_profile(sb, email, full_name or None)
-            unlocked = is_unlocked(sb, email)
-            user_key = email
-            st.success(f"✅ Signed in as {email} ({'Unlimited' if unlocked else 'Demo user'})")
-        except Exception as e:
-            st.warning(f"Login issue: {e}")
-            user_key = _guest_key_from_cookie()
-            unlocked = False
-    else:
-        user_key = _guest_key_from_cookie()
-        unlocked = False
-        st.info("Not signed in — running in demo mode (10 leads/day).")
-
+    # API key (from env/secrets)
     api_key = c.load_api_key()
     if not api_key:
         st.error("Server misconfigured: missing API key.")
@@ -302,6 +331,7 @@ def main():
 
     st.divider()
 
+    # Controls
     col1, col2 = st.columns(2)
     with col1:
         near_me = st.checkbox("Use my current area", value=True)
@@ -316,7 +346,12 @@ def main():
     requested = st.number_input("How many parks to find?", 1, 200, 10)
 
     if st.button("🚀 Find RV Parks"):
-        allowed, is_unlim, remaining = slice_by_trial(sb, user_key, int(requested))
+        user_key = str(st.session_state["user_key"])
+        unlocked = bool(st.session_state.get("unlocked"))
+        if unlocked:
+            allowed, is_unlim, remaining = (int(requested), True, -1)
+        else:
+            allowed, is_unlim, remaining = slice_by_trial(sb, user_key, int(requested))
 
         if not is_unlim and allowed <= 0:
             show_demo_limit(sb)
@@ -341,17 +376,11 @@ def main():
             st.info("No new parks found.")
             st.stop()
 
-        # ---------------------- CLEAN DISPLAY ----------------------
+        # ---------------------- Display ----------------------
         df = pd.DataFrame(rows)
-
-        # Drop internal ID
         if "park_place_id" in df.columns:
             df = df.drop(columns=["park_place_id"])
-
-        # 1-based row numbers
         df.insert(0, "#", range(1, len(df) + 1))
-
-        # Clickable park names
         if "website" in df.columns and "park_name" in df.columns:
             df["park_name"] = df.apply(
                 lambda x: f"[{x['park_name']}]({x['website']})" if x["website"] else x["park_name"],
@@ -360,15 +389,11 @@ def main():
             df = df.drop(columns=["website"])
 
         st.subheader(f"Results ({len(df)})")
-
-        # NOTE: df.to_markdown() requires 'tabulate' package
         try:
             st.markdown(df.to_markdown(index=False), unsafe_allow_html=True)
         except Exception:
-            # graceful fallback to a Streamlit dataframe
             st.dataframe(df, use_container_width=True, hide_index=True)
 
-        # CSV download
         buf = io.StringIO()
         df.to_csv(buf, index=False)
         st.download_button("⬇️ Download CSV", buf.getvalue(), "rv_parks.csv", "text/csv")
