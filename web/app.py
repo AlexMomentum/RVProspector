@@ -301,6 +301,8 @@ def show_demo_limit(sb, cm):
 # App
 # -----------------------------------------------------------------------------
 def main():
+    st.caption(f"using service key? {'yes' if os.getenv('SUPABASE_SERVICE_ROLE_KEY') else 'no'}")
+
     st.markdown("<h1>🗺️ RV Prospector</h1>", unsafe_allow_html=True)
     st.caption("Find RV parks without online booking — Demo gives you 10 new leads per day.")
 
