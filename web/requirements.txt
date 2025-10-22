@@ -1,13 +1,9 @@
-# web/requirements.txt
-# Keep versions lenient for easy install on Windows (no local compile)
-streamlit>=1.34,<2.0
-supabase>=2.6.0,<3.0
-pydantic>=2.8,<3.0
-python-dotenv>=1.0,<2.0
-
-# Your core already depends on these; included here to ensure web has them.
-pandas>=2.0,<3.0
-xlsxwriter>=3.0,<4.0
-openpyxl>=3.1,<4.0
-requests>=2.31,<3.0
-
+streamlit==1.38.0
+pandas
+requests
+python-dotenv
+supabase==2.6.0
+openpyxl
+xlsxwriter
+extra-streamlit-components
+tabulate
