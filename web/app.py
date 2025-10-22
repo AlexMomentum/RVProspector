@@ -239,7 +239,9 @@ def _generate_for_user(
 # -----------------------------------------------------------------------------
 # Demo-limit modal/dialog (version-safe)
 # -----------------------------------------------------------------------------
-def _render_demo_limit_body(sb):
+# In app.py
+
+def _render_demo_limit_body(sb, cm):
     st.markdown("### **Daily Demo Limit Reached**")
     st.write(
         "You’ve reached your 10 demo leads for today.\n\n"
@@ -257,10 +259,17 @@ def _render_demo_limit_body(sb):
                     si_email = st.text_input("Email", placeholder="you@example.com")
                     si_name = st.text_input("Full name (optional)")
                     si_submit = st.form_submit_button("🔓 Sign Up for Extended Use")
-                if si_submit:
+                if si_submit and si_email and "@" in si_email:
                     try:
                         record_signup(sb, si_email, si_name or None)
-                        st.success("Thanks! We’ll reach out shortly.")
+
+                        # NEW: immediately grant unlimited + sign them in
+                        from web.db import grant_unlimited  # or import at top
+                        grant_unlimited(sb, si_email, si_name or None)
+                        _set_signed_in(cm, si_email, True)  # updates session + cookie
+
+                        st.success("Thanks! Your account is now Unlimited.")
+                        st.rerun()
                     except Exception as e:
                         st.error(f"Could not save signup: {e}")
             else:
@@ -271,15 +280,14 @@ def _render_demo_limit_body(sb):
         else:
             st.caption("Set DONATE_URL to show a donate button.")
 
-
-def show_demo_limit(sb):
+def show_demo_limit(sb, cm):
     if hasattr(st, "modal"):
         with st.modal("Daily Demo Limit Reached", max_width=700):
-            _render_demo_limit_body(sb)
+            _render_demo_limit_body(sb, cm)
     else:
         @st.dialog("Daily Demo Limit Reached")
         def _dlg():
-            _render_demo_limit_body(sb)
+            _render_demo_limit_body(sb, cm)
         _dlg()
 
 
