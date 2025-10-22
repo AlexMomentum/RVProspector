@@ -5,5 +5,5 @@ python-dotenv
 supabase==2.6.0
 openpyxl
 xlsxwriter
-extra-streamlit-components
 tabulate
+extra-streamlit-components==0.1.71
