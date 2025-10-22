@@ -21,7 +21,7 @@ def _secrets_to_env():
         "GOOGLE_PLACES_API_KEY": ["GOOGLE_PLACES_API_KEY", "GOOGLE_MAPS_API_KEY", "GOOGLE_API_KEY"],
         "SUPABASE_URL": ["SUPABASE_URL"],
         "SUPABASE_ANON_KEY": ["SUPABASE_ANON_KEY"],
-        "SUPABASE_SERVICE_ROLE_KEY": ["SUPABASE_SERVICE_ROLE_KEY", "SERVICE_ROLE_KEY"],  # important if you want to write unlocked=true
+        "SUPABASE_SERVICE_ROLE_KEY": ["SUPABASE_SERVICE_ROLE_KEY", "SERVICE_ROLE_KEY"],  # needed to write unlocked=True
         "SIGNUP_URL": ["SIGNUP_URL"],
         "DONATE_URL": ["DONATE_URL"],
     }
@@ -37,12 +37,11 @@ def _secrets_to_env():
                 os.environ[env_name] = str(val)
                 break
 
-
 _secrets_to_env()
 
 # ----------- Configurable links (must exist before sidebar uses them) ----------
-SIGNUP_URL = os.getenv("SIGNUP_URL", "").strip()   # e.g. https://rvprospector.com/pricing
-DONATE_URL = os.getenv("DONATE_URL", "").strip()   # e.g. PayPal / BuyMeACoffee link
+SIGNUP_URL = os.getenv("SIGNUP_URL", "").strip()
+DONATE_URL = os.getenv("DONATE_URL", "").strip()
 
 # -----------------------------------------------------------------------------
 # Path setup so Python can find web/ and src/
@@ -55,17 +54,17 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 # -----------------------------------------------------------------------------
-# ✅ Single, robust import of web.db (works whether 'web' is a package or a folder)
+# ✅ Single, robust import of web.db
 # -----------------------------------------------------------------------------
 def _import_web_db():
-    # Try normal package import first
+    # Try normal import
     try:
         import web.db as dbmod
         return dbmod
     except Exception:
         pass
 
-    # Fallback: import by file path
+    # Fallback: import from file path (if 'web' isn't a package)
     import importlib.util, types
     web_dir = ROOT / "web"
     db_path = web_dir / "db.py"
@@ -84,19 +83,19 @@ try:
     db = _import_web_db()
 except Exception as e:
     st.error(f"Failed to import web.db: {e.__class__.__name__}: {e}")
-    st.code(''.join(traceback.format_exc()))
+    st.code("".join(traceback.format_exc()))
     st.stop()
 
-# Re-export helpers for local use
+# Re-export helpers
 fetch_history_place_ids = db.fetch_history_place_ids
-get_client              = db.get_client
-increment_leads         = db.increment_leads
-is_unlocked             = db.is_unlocked
-record_history          = db.record_history
-upsert_profile          = db.upsert_profile
-slice_by_trial          = db.slice_by_trial
-record_signup           = getattr(db, "record_signup", None)   # may be None
-grant_unlimited         = getattr(db, "grant_unlimited", None) # may be None
+get_client = db.get_client
+increment_leads = db.increment_leads
+is_unlocked = db.is_unlocked
+record_history = db.record_history
+upsert_profile = db.upsert_profile
+slice_by_trial = db.slice_by_trial
+record_signup = getattr(db, "record_signup", None)
+grant_unlimited = getattr(db, "grant_unlimited", None)
 
 # Import core AFTER paths are set
 from rvprospector import core as c  # noqa: E402
@@ -114,10 +113,9 @@ else:
     st.sidebar.caption("Set DONATE_URL to show a donate button.")
 
 # -----------------------------------------------------------------------------
-# Cookie helpers
+# Cookie + session helpers
 # -----------------------------------------------------------------------------
 def _ensure_guest_cookie(cm: stx.CookieManager, cookies: Dict[str, str]) -> str:
-    """Ensure there is a 'rvp_guest_id' cookie and return the session user_key."""
     gid = cookies.get("rvp_guest_id")
     if not gid:
         gid = str(uuid.uuid4())
@@ -130,9 +128,9 @@ def _set_signed_in(cm: stx.CookieManager, email: str, unlocked: bool):
     cm.set("rvp_email", email)
 
 def _sign_out(cm: stx.CookieManager):
-    st.session_state.pop("user_key", None)
-    st.session_state.pop("unlocked", None)
     cm.delete("rvp_email")
+    st.session_state.clear()
+    st.rerun()
 
 # -----------------------------------------------------------------------------
 # Location helpers
@@ -263,7 +261,7 @@ def _generate_for_user(
     return found
 
 # -----------------------------------------------------------------------------
-# Demo-limit modal/dialog (version-safe)
+# Demo-limit modal/dialog
 # -----------------------------------------------------------------------------
 def _render_demo_limit_body(sb, cm):
     st.markdown("### **Daily Demo Limit Reached**")
@@ -283,11 +281,11 @@ def _render_demo_limit_body(sb, cm):
                     si_email = st.text_input("Email", placeholder="you@example.com")
                     si_name = st.text_input("Full name (optional)")
                     si_submit = st.form_submit_button("🔓 Sign Up for Extended Use")
+
                 if si_submit and si_email and "@" in si_email:
                     try:
                         if record_signup:
                             record_signup(sb, si_email, si_name or None)
-                        # Unlock via helper or direct fallback
                         if grant_unlimited:
                             grant_unlimited(sb, si_email, si_name or None)
                         else:
@@ -306,7 +304,6 @@ def _render_demo_limit_body(sb, cm):
             st.link_button("💗 Donate", DONATE_URL, use_container_width=True)
         else:
             st.caption("Set DONATE_URL to show a donate button.")
-    # (Intentionally no Sign out button here; keep modal focused.)
 
 def show_demo_limit(sb, cm):
     if hasattr(st, "modal"):
@@ -322,9 +319,6 @@ def show_demo_limit(sb, cm):
 # App
 # -----------------------------------------------------------------------------
 def main():
-    # quick visibility for whether service role key is present
-    st.caption(f"using service key? {'yes' if os.getenv('SUPABASE_SERVICE_ROLE_KEY') else 'no'}")
-
     st.markdown("<h1>🗺️ RV Prospector</h1>", unsafe_allow_html=True)
     st.caption("Find RV parks without online booking — Demo gives you 10 new leads per day.")
 
@@ -339,25 +333,21 @@ def main():
     if cookies is None:
         st.stop()
 
-    # Initialize identity (restore from cookie or create guest)
+    # Initialize identity
     if "user_key" not in st.session_state:
         saved_email = cookies.get("rvp_email")
         if saved_email:
-            # NEVER DOWNGRADE unlocked once True
             prior = bool(st.session_state.get("unlocked"))
             try:
                 unlocked_db = bool(is_unlocked(sb, saved_email))
             except Exception:
                 unlocked_db = False
-            unlocked = prior or unlocked_db
-            _set_signed_in(cm, saved_email, unlocked)
+            _set_signed_in(cm, saved_email, prior or unlocked_db)  # don't downgrade
         else:
             st.session_state["user_key"] = _ensure_guest_cookie(cm, cookies)
             st.session_state["unlocked"] = False
 
-    # -----------------------------------------------------------------------------
-    # Account box
-    # -----------------------------------------------------------------------------
+    # ------------------------ Account box ------------------------
     with st.expander("🔐 Sign In / Account", expanded=False):
         is_guest = str(st.session_state["user_key"]).startswith("guest:")
 
@@ -370,16 +360,14 @@ def main():
             if submitted and email and "@" in email:
                 try:
                     upsert_profile(get_client(), email, full_name or None)
-                    unlocked_now = is_unlocked(get_client(), email)
-                    _set_signed_in(cm, email, bool(unlocked_now))
+                    unlocked_now = bool(is_unlocked(get_client(), email))
+                    _set_signed_in(cm, email, unlocked_now)
                     st.success(f"✅ Signed in as {email} ({'Unlimited' if unlocked_now else 'Demo user'})")
                     st.rerun()
                 except Exception as e:
                     st.warning(f"Login issue: {e}")
         else:
             user_email = str(st.session_state["user_key"])
-
-            # Always refresh unlocked, but NEVER DOWNGRADE
             session_unlocked = bool(st.session_state.get("unlocked"))
             try:
                 db_unlocked = bool(is_unlocked(get_client(), user_email))
@@ -393,7 +381,6 @@ def main():
                 f"({'Unlimited' if st.session_state.get('unlocked') else 'Demo user'})"
             )
 
-            # One-click unlock (uses service role key if configured)
             if not st.session_state.get("unlocked"):
                 if st.button("Activate Unlimited"):
                     try:
@@ -412,12 +399,11 @@ def main():
 
             if st.button("Sign out"):
                 _sign_out(cm)
-                st.rerun()
 
     # API key (from env/secrets)
     api_key = c.load_api_key()
     if not api_key:
-        st.error("Server misconfigured: missing Google API key.")
+        st.error("Server misconfigured: missing API key.")
         st.stop()
 
     st.divider()
@@ -488,13 +474,13 @@ def main():
         except Exception:
             st.dataframe(df, use_container_width=True, hide_index=True)
 
+        # CSV download
         buf = io.StringIO()
         df.to_csv(buf, index=False)
         st.download_button("⬇️ Download CSV", buf.getvalue(), "rv_parks.csv", "text/csv")
 
         with st.expander("Run Log"):
             st.code("\n".join(st.session_state.get("log", [])))
-
 
 if __name__ == "__main__":
     main()
