@@ -25,6 +25,7 @@ def _secrets_to_env():
         "GOOGLE_PLACES_API_KEY": ["GOOGLE_PLACES_API_KEY", "GOOGLE_MAPS_API_KEY", "GOOGLE_API_KEY"],
         "SUPABASE_URL":          ["SUPABASE_URL"],
         "SUPABASE_ANON_KEY":     ["SUPABASE_ANON_KEY"],
+        "SUPABASE_SERVICE_ROLE_KEY": ["SUPABASE_SERVICE_ROLE_KEY", "SERVICE_ROLE_KEY"],  # <- add SRK
     }
     for env_name, candidates in mappings.items():
         if os.getenv(env_name):
@@ -58,13 +59,9 @@ from web.db import (                # noqa: E402
     record_history,
     upsert_profile,
     slice_by_trial,
+    record_signup,
+    grant_unlimited,
 )
-
-# record_signup is optional; we’ll use it if present
-try:
-    from web.db import record_signup  # type: ignore
-except Exception:
-    record_signup = None  # type: ignore
 
 # -----------------------------------------------------------------------------
 # Page config + Sidebar
@@ -88,8 +85,6 @@ def _ensure_guest_cookie(cm: stx.CookieManager, cookies: Dict[str, str]) -> str:
     if not gid:
         gid = str(uuid.uuid4())
         cm.set("rvp_guest_id", gid)
-        # Optional: force a rerun so the new cookie is available next pass
-        # st.rerun()
     return f"guest:{gid}"
 
 
@@ -239,8 +234,6 @@ def _generate_for_user(
 # -----------------------------------------------------------------------------
 # Demo-limit modal/dialog (version-safe)
 # -----------------------------------------------------------------------------
-# In app.py
-
 def _render_demo_limit_body(sb, cm):
     st.markdown("### **Daily Demo Limit Reached**")
     st.write(
@@ -262,16 +255,9 @@ def _render_demo_limit_body(sb, cm):
 
                 if si_submit and si_email and "@" in si_email:
                     try:
-                        # 1) Record interest (existing behavior)
                         record_signup(sb, si_email, si_name or None)
-
-                        # 2) UNLOCK via secure RPC (you created this in SQL with SECURITY DEFINER)
-                        from web.db import grant_unlimited
-                        grant_unlimited(sb, si_email, si_name or None)
-
-                        # 3) Sign them in and flip session to Unlimited
+                        grant_unlimited(sb, si_email, si_name or None)  # flips unlocked
                         _set_signed_in(cm, si_email, True)
-
                         st.success("Thanks! Your account is now Unlimited.")
                         st.rerun()
                     except Exception as e:
@@ -285,7 +271,6 @@ def _render_demo_limit_body(sb, cm):
             st.caption("Set DONATE_URL to show a donate button.")
 
 
-# 2) Update the wrapper to pass `cm`
 def show_demo_limit(sb, cm):
     if hasattr(st, "modal"):
         with st.modal("Daily Demo Limit Reached", max_width=700):
@@ -301,12 +286,13 @@ def show_demo_limit(sb, cm):
 # App
 # -----------------------------------------------------------------------------
 def main():
+    # keep this little debug line for now
     st.caption(f"using service key? {'yes' if os.getenv('SUPABASE_SERVICE_ROLE_KEY') else 'no'}")
 
     st.markdown("<h1>🗺️ RV Prospector</h1>", unsafe_allow_html=True)
     st.caption("Find RV parks without online booking — Demo gives you 10 new leads per day.")
 
-    # Create exactly ONE CookieManager component with a unique key
+    # Exactly ONE CookieManager
     cm = stx.CookieManager(key="rvp_cookies")
 
     sb = get_client()
@@ -315,9 +301,9 @@ def main():
     # Fetch cookies ONCE per run
     cookies = cm.get_all()
     if cookies is None:
-        st.stop()  # first render pass; cookie manager will populate next run
+        st.stop()
 
-    # Initialize identity: restore from cookie or create guest (no extra get_all calls)
+    # Initialize identity
     if "user_key" not in st.session_state:
         saved_email = cookies.get("rvp_email")
         if saved_email:
@@ -351,6 +337,16 @@ def main():
                 f"Signed in as **{st.session_state['user_key']}** "
                 f"({'Unlimited' if st.session_state.get('unlocked') else 'Demo user'})"
             )
+
+            # 🔓 Explicit unlock button so you can enable Unlimited immediately
+            if not st.session_state.get("unlocked") and "@" in str(st.session_state["user_key"]):
+                if st.button("Activate Unlimited"):
+                    email = str(st.session_state["user_key"]).strip()
+                    grant_unlimited(sb, email)
+                    _set_signed_in(cm, email, True)
+                    st.success("Unlocked! Reloading…")
+                    st.rerun()
+
             if st.button("Sign out"):
                 _sign_out(cm)
                 st.rerun()
@@ -412,14 +408,11 @@ def main():
         # ---------------------- Clean display ----------------------
         df = pd.DataFrame(rows)
 
-        # drop internal ID
         if "park_place_id" in df.columns:
             df = df.drop(columns=["park_place_id"])
 
-        # 1-based index
         df.insert(0, "#", range(1, len(df) + 1))
 
-        # clickable park names
         if "website" in df.columns and "park_name" in df.columns:
             df["park_name"] = df.apply(
                 lambda x: f"[{x['park_name']}]({x['website']})" if x["website"] else x["park_name"],
@@ -428,13 +421,11 @@ def main():
             df = df.drop(columns=["website"])
 
         st.subheader(f"Results ({len(df)})")
-        # to_markdown requires 'tabulate'; fall back gracefully
         try:
             st.markdown(df.to_markdown(index=False), unsafe_allow_html=True)
         except Exception:
             st.dataframe(df, use_container_width=True, hide_index=True)
 
-        # CSV download
         buf = io.StringIO()
         df.to_csv(buf, index=False)
         st.download_button("⬇️ Download CSV", buf.getvalue(), "rv_parks.csv", "text/csv")
