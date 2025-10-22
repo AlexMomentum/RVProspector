@@ -1,5 +1,6 @@
 # web/app.py
 from __future__ import annotations
+
 import io
 import os
 import pathlib
@@ -11,13 +12,14 @@ import pandas as pd
 import streamlit as st
 import extra_streamlit_components as stx
 
-# Optional marketing links (set in env or Streamlit secrets)
+# ----------- Configurable links (set via env or Streamlit secrets) -----------
 SIGNUP_URL = os.getenv("SIGNUP_URL", "").strip()   # e.g. https://rvprospector.com/pricing
-DONATE_URL = os.getenv("DONATE_URL", "").strip()   # e.g. PayPal / BMC link
+DONATE_URL = os.getenv("DONATE_URL", "").strip()   # e.g. PayPal / BuyMeACoffee link
 
-# --------------------------------------------------------------------------------------
-# Secrets -> Environment (for Streamlit Cloud compatibility)
-# --------------------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Secrets -> env (for Streamlit Cloud)
+# -----------------------------------------------------------------------------
 def _secrets_to_env():
     mappings = {
         "GOOGLE_PLACES_API_KEY": ["GOOGLE_PLACES_API_KEY", "GOOGLE_MAPS_API_KEY", "GOOGLE_API_KEY"],
@@ -28,14 +30,18 @@ def _secrets_to_env():
         if os.getenv(env_name):
             continue
         for key in candidates:
-            val = st.secrets.get(key)
+            try:
+                val = st.secrets.get(key)
+            except Exception:
+                val = None
             if val:
                 os.environ[env_name] = str(val)
                 break
 
+
 _secrets_to_env()
 
-# Make project importable: python -m streamlit run web/app.py
+# Make local modules importable when running:  streamlit run web/app.py
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT / "src"
 if str(ROOT) not in sys.path:
@@ -54,15 +60,15 @@ from web.db import (                # noqa: E402
     slice_by_trial,
 )
 
-# record_signup is optional – only used for inline capture in the modal
+# record_signup is optional; we’ll use it if present
 try:
     from web.db import record_signup  # type: ignore
 except Exception:
     record_signup = None  # type: ignore
 
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Page config + Sidebar
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 st.set_page_config(page_title="RV Prospector (Web)", page_icon="🗺️", layout="centered")
 
 st.sidebar.markdown("### ❤️ Support RV Prospector")
@@ -70,53 +76,50 @@ st.sidebar.markdown("If this tool helps you, consider donating to keep it runnin
 if DONATE_URL:
     st.sidebar.link_button("Donate", DONATE_URL)
 else:
-    st.sidebar.caption("Set DONATE_URL in your environment to show a donate button.")
+    st.sidebar.caption("Set DONATE_URL to show a donate button.")
 
-# --------------------------------------------------------------------------------------
-# Cookie helpers (guests + “remember me”)
-# --------------------------------------------------------------------------------------
-def _cookie_mgr():
-    if "cookie_manager" not in st.session_state:
-        st.session_state["cookie_manager"] = stx.CookieManager()
-    return st.session_state["cookie_manager"]
 
-def _guest_key_from_cookie() -> str:
-    cm = _cookie_mgr()
+# -----------------------------------------------------------------------------
+# Cookie helpers (NO component construction here)
+# -----------------------------------------------------------------------------
+def _guest_key_from_cookie(cm: stx.CookieManager) -> str:
     cookies = cm.get_all()
     if cookies is None:
-        st.stop()  # wait for the rerun
+        st.stop()  # wait for first render pass
     gid = cookies.get("rvp_guest_id")
     if not gid:
         gid = str(uuid.uuid4())
         cm.set("rvp_guest_id", gid)
     return f"guest:{gid}"
 
-def _set_signed_in(email: str, unlocked: bool):
+
+def _set_signed_in(cm: stx.CookieManager, email: str, unlocked: bool):
     st.session_state["user_key"] = email
     st.session_state["unlocked"] = bool(unlocked)
-    cm = _cookie_mgr()
-    cm.set("rvp_email", email)  # persist across refreshes
+    cm.set("rvp_email", email)
 
-def _sign_out():
+
+def _sign_out(cm: stx.CookieManager):
     st.session_state.pop("user_key", None)
     st.session_state.pop("unlocked", None)
-    cm = _cookie_mgr()
     cm.delete("rvp_email")
 
-# --------------------------------------------------------------------------------------
-# Location helper
-# --------------------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Location helpers
+# -----------------------------------------------------------------------------
 US_STATES = {
-    "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas","CA":"California","CO":"Colorado",
-    "CT":"Connecticut","DE":"Delaware","FL":"Florida","GA":"Georgia","HI":"Hawaii","ID":"Idaho",
-    "IL":"Illinois","IN":"Indiana","IA":"Iowa","KS":"Kansas","KY":"Kentucky","LA":"Louisiana",
-    "ME":"Maine","MD":"Maryland","MA":"Massachusetts","MI":"Michigan","MN":"Minnesota","MS":"Mississippi",
-    "MO":"Missouri","MT":"Montana","NE":"Nebraska","NV":"Nevada","NH":"New Hampshire","NJ":"New Jersey",
-    "NM":"New Mexico","NY":"New York","NC":"North Carolina","ND":"North Dakota","OH":"Ohio","OK":"Oklahoma",
-    "OR":"Oregon","PA":"Pennsylvania","RI":"Rhode Island","SC":"South Carolina","SD":"South Dakota",
-    "TN":"Tennessee","TX":"Texas","UT":"Utah","VT":"Vermont","VA":"Virginia","WA":"Washington",
-    "WV":"West Virginia","WI":"Wisconsin","WY":"Wyoming","DC":"District of Columbia"
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas", "CA": "California", "CO": "Colorado",
+    "CT": "Connecticut", "DE": "Delaware", "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+    "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas", "KY": "Kentucky", "LA": "Louisiana",
+    "ME": "Maine", "MD": "Maryland", "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
+    "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada", "NH": "New Hampshire", "NJ": "New Jersey",
+    "NM": "New Mexico", "NY": "New York", "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
+    "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina", "SD": "South Dakota",
+    "TN": "Tennessee", "TX": "Texas", "UT": "Utah", "VT": "Vermont", "VA": "Virginia", "WA": "Washington",
+    "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming", "DC": "District of Columbia"
 }
+
 
 def normalize_location(raw: str) -> str:
     s = (raw or "").strip()
@@ -128,9 +131,10 @@ def normalize_location(raw: str) -> str:
         return f"{s.title()}, USA"
     return s
 
-# --------------------------------------------------------------------------------------
-# Core search
-# --------------------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Search core
+# -----------------------------------------------------------------------------
 def _generate_for_user(
     api_key: str,
     email: str,
@@ -138,7 +142,7 @@ def _generate_for_user(
     requested: int,
     avoid_conglomerates: bool,
     near_me: bool,
-    radius_m: int = 50_000
+    radius_m: int = 50_000,
 ) -> List[Dict[str, Any]]:
     sb = get_client()
     already = fetch_history_place_ids(sb, email)
@@ -191,9 +195,12 @@ def _generate_for_user(
                 comps = {"city": "", "state": "", "zip": ""}
                 for comp in det.get("address_components", []) or []:
                     types = comp.get("types", [])
-                    if "locality" in types: comps["city"] = comp.get("long_name", "")
-                    if "administrative_area_level_1" in types: comps["state"] = comp.get("short_name", "")
-                    if "postal_code" in types: comps["zip"] = comp.get("long_name", "")
+                    if "locality" in types:
+                        comps["city"] = comp.get("long_name", "")
+                    if "administrative_area_level_1" in types:
+                        comps["state"] = comp.get("short_name", "")
+                    if "postal_code" in types:
+                        comps["zip"] = comp.get("long_name", "")
 
                 if avoid_conglomerates and c._is_conglomerate(name, website):
                     seen.add(pid)
@@ -228,9 +235,10 @@ def _generate_for_user(
 
     return found
 
-# --------------------------------------------------------------------------------------
-# Demo-limit popup (uses st.modal if available, else st.dialog)
-# --------------------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Demo-limit modal/dialog (version-safe)
+# -----------------------------------------------------------------------------
 def _render_demo_limit_body(sb):
     st.markdown("### **Daily Demo Limit Reached**")
     st.write(
@@ -256,12 +264,13 @@ def _render_demo_limit_body(sb):
                     except Exception as e:
                         st.error(f"Could not save signup: {e}")
             else:
-                st.caption("Set SIGNUP_URL (or implement record_signup) to enable sign-ups here.")
+                st.caption("Set SIGNUP_URL or implement record_signup() to collect signups here.")
     with cols[1]:
         if DONATE_URL:
             st.link_button("💗 Donate", DONATE_URL, use_container_width=True)
         else:
             st.caption("Set DONATE_URL to show a donate button.")
+
 
 def show_demo_limit(sb):
     if hasattr(st, "modal"):
@@ -273,18 +282,23 @@ def show_demo_limit(sb):
             _render_demo_limit_body(sb)
         _dlg()
 
-# --------------------------------------------------------------------------------------
-# UI
-# --------------------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# App
+# -----------------------------------------------------------------------------
 def main():
     st.markdown("<h1>🗺️ RV Prospector</h1>", unsafe_allow_html=True)
     st.caption("Find RV parks without online booking — Demo gives you 10 new leads per day.")
 
+    # Create exactly ONE CookieManager component with a unique key
+    if "cookie_manager" not in st.session_state:
+        st.session_state["cookie_manager"] = stx.CookieManager(key="rvp_cookies")
+    cm: stx.CookieManager = st.session_state["cookie_manager"]
+
     sb = get_client()
     st.session_state.setdefault("log", [])
 
-    # Restore identity from cookie or create guest on first run
-    cm = _cookie_mgr()
+    # Initialize identity: restore from cookie or create guest
     cookies = cm.get_all()
     if cookies is None:
         st.stop()
@@ -295,9 +309,9 @@ def main():
                 unlocked = is_unlocked(sb, saved_email)
             except Exception:
                 unlocked = False
-            _set_signed_in(saved_email, unlocked)
+            _set_signed_in(cm, saved_email, unlocked)
         else:
-            st.session_state["user_key"] = _guest_key_from_cookie()
+            st.session_state["user_key"] = _guest_key_from_cookie(cm)
             st.session_state["unlocked"] = False
 
     # Account box
@@ -311,16 +325,18 @@ def main():
                 try:
                     upsert_profile(sb, email, full_name or None)
                     unlocked = is_unlocked(sb, email)
-                    _set_signed_in(email, unlocked)
-                    st.success(f"✅ Signed in as {email} "
-                               f"({'Unlimited' if unlocked else 'Demo user'})")
+                    _set_signed_in(cm, email, unlocked)
+                    st.success(f"✅ Signed in as {email} ({'Unlimited' if unlocked else 'Demo user'})")
+                    st.rerun()
                 except Exception as e:
                     st.warning(f"Login issue: {e}")
         else:
-            st.write(f"Signed in as **{st.session_state['user_key']}** "
-                     f"({'Unlimited' if st.session_state.get('unlocked') else 'Demo user'})")
+            st.write(
+                f"Signed in as **{st.session_state['user_key']}** "
+                f"({'Unlimited' if st.session_state.get('unlocked') else 'Demo user'})"
+            )
             if st.button("Sign out"):
-                _sign_out()
+                _sign_out(cm)
                 st.rerun()
 
     # API key (from env/secrets)
@@ -346,12 +362,13 @@ def main():
     requested = st.number_input("How many parks to find?", 1, 200, 10)
 
     if st.button("🚀 Find RV Parks"):
-        user_key = str(st.session_state["user_key"])
+        user_key = st.session_state["user_key"]
         unlocked = bool(st.session_state.get("unlocked"))
-        if unlocked:
-            allowed, is_unlim, remaining = (int(requested), True, -1)
-        else:
-            allowed, is_unlim, remaining = slice_by_trial(sb, user_key, int(requested))
+
+        # Demo/Unlimited slicing
+        allowed, is_unlim, remaining = (requested, True, -1) if unlocked else slice_by_trial(
+            sb, user_key, int(requested)
+        )
 
         if not is_unlim and allowed <= 0:
             show_demo_limit(sb)
@@ -363,12 +380,12 @@ def main():
                 api_key=api_key,
                 email=user_key,
                 location=location or "",
-                requested=allowed,
+                requested=int(allowed),
                 avoid_conglomerates=avoid_conglom,
                 near_me=use_near_me,
             )
             record_history(sb, user_key, rows)
-            if not is_unlim and not user_key.startswith("guest:"):
+            if not is_unlim and not str(user_key).startswith("guest:"):
                 increment_leads(sb, user_key, len(rows))
             status.update(label="✅ Done", state="complete")
 
@@ -376,30 +393,39 @@ def main():
             st.info("No new parks found.")
             st.stop()
 
-        # ---------------------- Display ----------------------
+        # ---------------------- Clean display ----------------------
         df = pd.DataFrame(rows)
+
+        # drop internal ID
         if "park_place_id" in df.columns:
             df = df.drop(columns=["park_place_id"])
+
+        # 1-based index
         df.insert(0, "#", range(1, len(df) + 1))
+
+        # clickable park names
         if "website" in df.columns and "park_name" in df.columns:
             df["park_name"] = df.apply(
                 lambda x: f"[{x['park_name']}]({x['website']})" if x["website"] else x["park_name"],
-                axis=1
+                axis=1,
             )
             df = df.drop(columns=["website"])
 
         st.subheader(f"Results ({len(df)})")
+        # to_markdown requires 'tabulate'; fall back gracefully
         try:
             st.markdown(df.to_markdown(index=False), unsafe_allow_html=True)
         except Exception:
             st.dataframe(df, use_container_width=True, hide_index=True)
 
+        # CSV download
         buf = io.StringIO()
         df.to_csv(buf, index=False)
         st.download_button("⬇️ Download CSV", buf.getvalue(), "rv_parks.csv", "text/csv")
 
         with st.expander("Run Log"):
             st.code("\n".join(st.session_state.get("log", [])))
+
 
 if __name__ == "__main__":
     main()
