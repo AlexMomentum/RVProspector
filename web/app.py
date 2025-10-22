@@ -47,40 +47,53 @@ DONATE_URL = os.getenv("DONATE_URL", "").strip()   # e.g. PayPal / BuyMeACoffee 
 # -----------------------------------------------------------------------------
 # Path setup so Python can find web/ and src/
 # -----------------------------------------------------------------------------
-ROOT = pathlib.Path(__file__).resolve().parents[1]   # /.../rvprospector
+# -----------------------------------------------------------------------------
+# Add local modules to sys.path
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Path setup so Python can find web/ and src/
+# -----------------------------------------------------------------------------
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT / "src"
-WEB_DIR = pathlib.Path(__file__).resolve().parent     # /.../rvprospector/web
-
-for p in (str(ROOT), str(SRC_DIR), str(WEB_DIR)):
-    if p not in sys.path:
-        sys.path.insert(0, p)
-
-# Import your core only AFTER paths are set
-from rvprospector import core as c  # noqa: E402
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 # -----------------------------------------------------------------------------
-# Safe import of web.db (gives readable error instead of redacted blob)
+# ✅ Single, robust import of web.db
 # -----------------------------------------------------------------------------
-try:
-    import web.db as db
-except ModuleNotFoundError:
-    # Fallback: load directly from file path if 'web' package not found
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("web.db", WEB_DIR / "db.py")
-    db = importlib.util.module_from_spec(spec)
+def _import_web_db():
+    # First try normal package import
+    try:
+        import web.db as dbmod
+        return dbmod
+    except Exception:
+        pass
 
-    import types
+    # Fallback: import by file path (works even if 'web' isn't a package)
+    import importlib.util, types
+    web_dir = ROOT / "web"
+    db_path = web_dir / "db.py"
+    if not db_path.exists():
+        raise RuntimeError(f"Could not find web/db.py at {db_path}")
+
+    spec = importlib.util.spec_from_file_location("web.db", db_path)
+    dbmod = importlib.util.module_from_spec(spec)
     sys.modules.setdefault("web", types.ModuleType("web"))
-    sys.modules["web.db"] = db
-
+    sys.modules["web.db"] = dbmod
     assert spec.loader is not None
-    spec.loader.exec_module(db)
+    spec.loader.exec_module(dbmod)
+    return dbmod
+
+try:
+    db = _import_web_db()
 except Exception as e:
     st.error(f"Failed to import web.db: {e.__class__.__name__}: {e}")
     st.code(''.join(traceback.format_exc()))
     st.stop()
 
-# Re-export for the rest of app.py
+# Re-export helpers for local use
 fetch_history_place_ids = db.fetch_history_place_ids
 get_client              = db.get_client
 increment_leads         = db.increment_leads
@@ -88,9 +101,11 @@ is_unlocked             = db.is_unlocked
 record_history          = db.record_history
 upsert_profile          = db.upsert_profile
 slice_by_trial          = db.slice_by_trial
-record_signup           = getattr(db, "record_signup", None)
-grant_unlimited         = getattr(db, "grant_unlimited", None)
+record_signup           = getattr(db, "record_signup", None)   # may be None
+grant_unlimited         = getattr(db, "grant_unlimited", None) # may be None
 
+# Import core AFTER paths are set
+from rvprospector import core as c  # noqa: E402
 
 # -----------------------------------------------------------------------------
 # Page config + Sidebar
@@ -291,8 +306,9 @@ def _render_demo_limit_body(sb, cm):
                         st.rerun()
                     except Exception as e:
                         st.error(f"Could not save signup: {e}")
-            else:
-                st.caption("Set SIGNUP_URL or implement record_signup() to collect signups here.")
+
+                    else:
+                        st.caption("Set SIGNUP_URL or implement record_signup() to collect signups here.")
     with cols[1]:
         if DONATE_URL:
             st.link_button("💗 Donate", DONATE_URL, use_container_width=True)
@@ -346,60 +362,66 @@ def main():
             st.session_state["unlocked"] = False
 
     # Account box
-    with st.expander("🔐 Sign In / Account", expanded=False):
-        if str(st.session_state["user_key"]).startswith("guest:"):
-            with st.form("login", border=False):
-                email = st.text_input("Email (optional, for saving your history)")
-                full_name = st.text_input("Full Name (optional)")
-                submitted = st.form_submit_button("Sign In")
-            if submitted and email and "@" in email:
+    # -----------------------------------------------------------------------------
+# Account box (drop-in)
+# -----------------------------------------------------------------------------
+with st.expander("🔐 Sign In / Account", expanded=False):
+    is_guest = str(st.session_state["user_key"]).startswith("guest:")
+
+    if is_guest:
+        with st.form("login", border=False):
+            email = st.text_input("Email (optional, for saving your history)")
+            full_name = st.text_input("Full Name (optional)")
+            submitted = st.form_submit_button("Sign In")
+
+        if submitted and email and "@" in email:
+            try:
+                upsert_profile(get_client(), email, full_name or None)
+                unlocked_now = is_unlocked(get_client(), email)
+                _set_signed_in(cm, email, unlocked_now)
+                st.success(f"✅ Signed in as {email} ({'Unlimited' if unlocked_now else 'Demo user'})")
+                st.rerun()
+            except Exception as e:
+                st.warning(f"Login issue: {e}")
+    else:
+        user_email = str(st.session_state["user_key"])
+
+        # Always refresh unlocked from DB on each render
+        try:
+            current_unlocked = bool(is_unlocked(get_client(), user_email))
+        except Exception:
+            current_unlocked = bool(st.session_state.get("unlocked"))
+        _set_signed_in(cm, user_email, current_unlocked)
+
+        st.write(
+            f"Signed in as **{user_email}** "
+            f"({'Unlimited' if st.session_state.get('unlocked') else 'Demo user'})"
+        )
+
+        # 🔓 One-click unlock (service role key recommended)
+        if not st.session_state.get("unlocked"):
+            if st.button("Activate Unlimited"):
                 try:
-                    upsert_profile(sb, email, full_name or None)
-                    unlocked = is_unlocked(sb, email)
-                    _set_signed_in(cm, email, unlocked)
-                    st.success(f"✅ Signed in as {email} ({'Unlimited' if unlocked else 'Demo user'})")
+                    upsert_profile(get_client(), user_email, None)
+                    if grant_unlimited:
+                        grant_unlimited(get_client(), user_email, None)
+                    else:
+                        # Fallback: do the upsert directly
+                        get_client().table("profiles").upsert(
+                            {"email": user_email, "unlocked": True}
+                        ).execute()
+
+                    _set_signed_in(cm, user_email, True)
+                    st.success("Unlimited activated for your account.")
                     st.rerun()
                 except Exception as e:
-                    st.warning(f"Login issue: {e}")
-            else:
-                user_email = str(st.session_state["user_key"])
+                    st.error(f"Failed to activate unlimited: {e}")
 
-                # Always refresh unlocked flag from DB each render
-                try:
-                    current_unlocked = is_unlocked(get_client(), user_email)
-                except Exception:
-                    current_unlocked = bool(st.session_state.get("unlocked"))
-                _set_signed_in(cm, user_email, bool(current_unlocked))
+        if st.button("Sign out"):
+            _sign_out(cm)
+            st.rerun()
 
-                st.write(
-                    f"Signed in as **{user_email}** "
-                    f"({'Unlimited' if st.session_state.get('unlocked') else 'Demo user'})"
-                )
 
-                # 🔓 One-click unlock using service key (if present)
-                if not st.session_state.get("unlocked"):
-                    if st.button("Activate Unlimited"):
-                        try:
-                            # ensure the profile row exists
-                            upsert_profile(get_client(), user_email, None)
-
-                            # flip unlocked=true (uses service role key if configured)
-                            if grant_unlimited:
-                                grant_unlimited(get_client(), user_email, None)
-                            else:
-                                get_client().table("profiles").upsert(
-                                    {"email": user_email, "unlocked": True}
-                                ).execute()
-
-                            _set_signed_in(cm, user_email, True)
-                            st.success("Unlimited activated for your account.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Failed to activate unlimited: {e}")
-
-                if st.button("Sign out"):
-                    _sign_out(cm)
-                    st.rerun()
 
 
     # API key (from env/secrets)
