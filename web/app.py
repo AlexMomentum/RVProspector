@@ -12,6 +12,9 @@ from typing import Any, Dict, List
 import pandas as pd
 import streamlit as st
 import extra_streamlit_components as stx
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 # -----------------------------------------------------------------------------
 # Secrets -> env (for Streamlit Cloud)
@@ -186,6 +189,51 @@ def _generate_for_user(
             emit("[warn] Could not auto-detect location from IP; using manual location.")
             near_me = False
 
+    # ---------- helper to evaluate one candidate place_id ----------
+    def eval_place(pid: str, r_name_fallback: str) -> Dict[str, Any] | None:
+        nonlocal checked
+        try:
+            det = c.google_place_details(api_key, pid)
+            name = det.get("name", r_name_fallback)
+            website = c._sanitize_url(det.get("website", ""))
+            phone = det.get("formatted_phone_number", "") or det.get("international_phone_number", "")
+            addr = det.get("formatted_address", "")
+            comps = {"city": "", "state": "", "zip": ""}
+            for comp in det.get("address_components", []) or []:
+                types = comp.get("types", [])
+                if "locality" in types:
+                    comps["city"] = comp.get("long_name", "")
+                if "administrative_area_level_1" in types:
+                    comps["state"] = comp.get("short_name", "")
+                if "postal_code" in types:
+                    comps["zip"] = comp.get("long_name", "")
+
+            if avoid_conglomerates and c._is_conglomerate(name, website):
+                return None
+
+            # make sure the website scrape can't hang forever
+            no_booking, booking_hit, pad_count = c.check_booking_and_pads(website, timeout_sec=7)
+            qualifies = no_booking and (pad_count is None or pad_count >= c.PAD_MIN)
+            if not qualifies:
+                return None
+
+            row = {
+                "park_place_id": pid,
+                "park_name": name,
+                "website": website,
+                "phone": phone,
+                "address": addr,
+                "city": comps["city"],
+                "state": comps["state"],
+                "zip": comps["zip"],
+                "pad_count": pad_count or "",
+                "source": "Google Places",
+            }
+            return row
+        finally:
+            checked += 1
+
+    # --------------------------------------------------------------
     for query in c.TARGET_QUERIES:
         where = "your current area" if near_me else location
         emit(f"[info] Searching '{query}' near {where}")
@@ -203,57 +251,33 @@ def _generate_for_user(
             results = data.get("results", [])
             token = data.get("next_page_token")
 
+            # Filter new candidates we haven't seen/already saved
+            candidates: list[tuple[str, str]] = []
             for r in results:
-                if checked >= c.MAX_RESULTS_TO_CHECK or len(found) >= requested:
+                if len(found) >= requested:
                     break
-
                 pid = r.get("place_id")
                 if not pid or pid in seen or pid in already:
                     continue
-
-                checked += 1
-                det = c.google_place_details(api_key, pid)
-                name = det.get("name", r.get("name", ""))
-                website = c._sanitize_url(det.get("website", ""))
-                phone = det.get("formatted_phone_number", "") or det.get("international_phone_number", "")
-                addr = det.get("formatted_address", "")
-                comps = {"city": "", "state": "", "zip": ""}
-                for comp in det.get("address_components", []) or []:
-                    types = comp.get("types", [])
-                    if "locality" in types:
-                        comps["city"] = comp.get("long_name", "")
-                    if "administrative_area_level_1" in types:
-                        comps["state"] = comp.get("short_name", "")
-                    if "postal_code" in types:
-                        comps["zip"] = comp.get("long_name", "")
-
-                if avoid_conglomerates and c._is_conglomerate(name, website):
-                    seen.add(pid)
-                    continue
-
-                no_booking, booking_hit, pad_count = c.check_booking_and_pads(website)
-                qualifies = no_booking and (pad_count is None or pad_count >= c.PAD_MIN)
-                if not qualifies:
-                    seen.add(pid)
-                    continue
-
-                row = {
-                    "park_place_id": pid,
-                    "park_name": name,
-                    "website": website,
-                    "phone": phone,
-                    "address": addr,
-                    "city": comps["city"],
-                    "state": comps["state"],
-                    "zip": comps["zip"],
-                    "pad_count": pad_count or "",
-                    "source": "Google Places",
-                }
-                found.append(row)
                 seen.add(pid)
+                candidates.append((pid, r.get("name", "")))
 
-            if not token or checked >= c.MAX_RESULTS_TO_CHECK or len(found) >= requested:
+            if candidates:
+                # Evaluate candidates in parallel
+                with ThreadPoolExecutor(max_workers=8) as ex:
+                    futs = [ex.submit(eval_place, pid, nm) for pid, nm in candidates]
+                    for fut in as_completed(futs):
+                        row = fut.result()
+                        if row:
+                            found.append(row)
+                            if len(found) >= requested:
+                                break
+
+            if not token or len(found) >= requested:
                 break
+
+            # Per Google Places docs, next_page_token takes ~2s to become valid
+            time.sleep(2.0)
 
         if len(found) >= requested:
             break
