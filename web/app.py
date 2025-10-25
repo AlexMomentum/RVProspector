@@ -16,20 +16,24 @@ import extra_streamlit_components as stx
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Tunables / Perf (override via env without redeploy)
-# -----------------------------------------------------------------------------
+# =============================================================================
 WORKERS = int(os.getenv("RVP_WORKERS", "20"))
 DEFAULT_NEAR_ME_RADIUS_M = int(os.getenv("RVP_RADIUS_M", "25000"))
 TARGET_QUERY_LIMIT = int(os.getenv("RVP_QUERY_LIMIT", "999"))
 PAGE_SLEEP_SECS = float(os.getenv("RVP_PAGE_SLEEP", "2.2"))
 
 PAGE_SIZE_HISTORY = 20        # rows per history page
-SEARCH_HARD_CAP = 100         # maximum parks per search (server-side enforcement)
+SEARCH_HARD_CAP     = 100     # maximum parks per search (server-side enforcement)
 
-# -----------------------------------------------------------------------------
+# Cookie security (use True on Streamlit Cloud / HTTPS, False for localhost dev)
+COOKIE_SECURE = os.getenv("RVP_COOKIE_SECURE", "false").strip().lower() == "true"
+COOKIE_SAMESITE = os.getenv("RVP_COOKIE_SAMESITE", "Lax")
+
+# =============================================================================
 # Secrets -> env (for Streamlit Cloud)
-# -----------------------------------------------------------------------------
+# =============================================================================
 def _secrets_to_env():
     mappings = {
         "GOOGLE_PLACES_API_KEY": ["GOOGLE_PLACES_API_KEY", "GOOGLE_MAPS_API_KEY", "GOOGLE_API_KEY"],
@@ -55,9 +59,9 @@ _secrets_to_env()
 SIGNUP_URL = os.getenv("SIGNUP_URL", "").strip()
 DONATE_URL = os.getenv("DONATE_URL", "").strip()
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Path setup so Python can find web/ and src/
-# -----------------------------------------------------------------------------
+# =============================================================================
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT / "src"
 if str(ROOT) not in sys.path:
@@ -65,9 +69,9 @@ if str(ROOT) not in sys.path:
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # ✅ Import web.db (works whether web is a package or not)
-# -----------------------------------------------------------------------------
+# =============================================================================
 def _import_web_db():
     try:
         import web.db as dbmod
@@ -104,7 +108,7 @@ slice_by_trial = db.slice_by_trial
 record_signup = getattr(db, "record_signup", None)
 grant_unlimited = getattr(db, "grant_unlimited", None)
 
-# --- Fallbacks if deployed db.py lacks list_history_* helpers -----------------
+# Fallbacks if deployed db.py lacks list_history_* helpers (adds pagination)
 def _fallback_list_history_rows(sb, user_key: str, limit: int = 1000, offset: int = 0) -> list[dict]:
     return (
         sb.table("history")
@@ -142,7 +146,6 @@ def _fallback_list_history_all(sb, user_key: str) -> list[dict]:
 
 list_history_rows = getattr(db, "list_history_rows", None)
 if list_history_rows is None:
-    # Wrap fallback to accept (limit, offset)
     def list_history_rows(sb, user_key: str, limit: int = 1000, offset: int = 0):
         return _fallback_list_history_rows(sb, user_key, limit=limit, offset=offset)
 
@@ -151,9 +154,9 @@ list_history_all = getattr(db, "list_history_all", _fallback_list_history_all)
 # Import core after sys.path updates
 from rvprospector import core as c  # noqa: E402
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Page config + Sidebar
-# -----------------------------------------------------------------------------
+# =============================================================================
 st.set_page_config(page_title="RV Prospector (Web)", page_icon="🗺️", layout="centered")
 
 st.sidebar.markdown("### ❤️ Support RV Prospector")
@@ -163,18 +166,18 @@ if DONATE_URL:
 else:
     st.sidebar.caption("Set DONATE_URL to show a donate button.")
 
-# -----------------------------------------------------------------------------
-# Cookie + session helpers (persistent + version-tolerant)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Cookie + session helpers (persistent + dev/prod aware)
+# =============================================================================
 def _cm_set(cm: stx.CookieManager, key: str, value: str):
     expires_at = datetime.utcnow() + timedelta(days=180)
     try:
-        cm.set(key, value, expires_at=expires_at, key=key, path="/", secure=True, samesite="Lax")
+        cm.set(key, value, expires_at=expires_at, key=key, path="/", secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE)
         return
     except TypeError:
         pass
     try:
-        cm.set(key, value, expiry_days=180, key=key, path="/", secure=True, samesite="Lax")
+        cm.set(key, value, expiry_days=180, key=key, path="/", secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE)
         return
     except TypeError:
         pass
@@ -194,7 +197,6 @@ def _ensure_guest_cookie(cm: stx.CookieManager, cookies: Dict[str, str]) -> str:
     if not gid:
         gid = str(uuid.uuid4())
         _cm_set(cm, "rvp_guest_id", gid)
-        # no rerun here → avoids the blank “flash”
     return f"guest:{gid}"
 
 def _set_signed_in(cm: stx.CookieManager, email: str, unlocked: bool):
@@ -207,9 +209,9 @@ def _sign_out(cm: stx.CookieManager):
     st.session_state.clear()
     st.rerun()
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Location helpers
-# -----------------------------------------------------------------------------
+# =============================================================================
 US_STATES = {
     "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas", "CA": "California", "CO": "Colorado",
     "CT": "Connecticut", "DE": "Delaware", "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
@@ -231,9 +233,9 @@ def normalize_location(raw: str) -> str:
         return f"{s.title()}, USA"
     return s
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Cached calls
-# -----------------------------------------------------------------------------
+# =============================================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_place_details(api_key: str, pid: str) -> Dict[str, Any]:
     return c.google_place_details(api_key, pid)
@@ -251,9 +253,9 @@ def _cached_text_search(api_key: str, query: str, location_bias: str | None,
         radius_m=radius_m,
     )
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Search core
-# -----------------------------------------------------------------------------
+# =============================================================================
 def _generate_for_user(
     api_key: str,
     email: str,
@@ -405,9 +407,9 @@ def _generate_for_user(
     emit(f"[info] Completed. Found {len(found)} new parks.")
     return found
 
-# -----------------------------------------------------------------------------
-# Demo-limit modal/dialog (unchanged)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Demo-limit modal/dialog
+# =============================================================================
 def _render_demo_limit_body(sb, cm):
     st.markdown("### **Daily Demo Limit Reached**")
     st.write(
@@ -460,9 +462,9 @@ def show_demo_limit(sb, cm):
             _render_demo_limit_body(sb, cm)
         _dlg()
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # App
-# -----------------------------------------------------------------------------
+# =============================================================================
 def main():
     st.markdown("<h1>🗺️ RV Prospector</h1>", unsafe_allow_html=True)
     st.caption("Find RV parks without online booking — Demo gives you 10 new leads per day.")
@@ -550,27 +552,39 @@ def main():
 
     st.divider()
 
-    # -------------------------------------------------------------------------
-    # 📜 View My Search History + CSV (clickable + pagination)
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # 📜 View My Search History + CSV (clickable + pagination without jarring reruns)
+    # =========================================================================
     with st.expander("📜 View My Search History", expanded=False):
         user_key = str(st.session_state.get("user_key", "")) or ""
         if not user_key:
             st.info("Sign in or continue as guest to build your history.")
         else:
-            st.session_state.setdefault("__hist_page", 0)
-            colA, colB, colC = st.columns([1,1,6])
-            with colA:
-                if st.button("◀ Prev", disabled=st.session_state["__hist_page"] <= 0):
-                    st.session_state["__hist_page"] = max(0, st.session_state["__hist_page"] - 1)
-                    st.rerun()
-            with colB:
-                if st.button("Next ▶"):
-                    st.session_state["__hist_page"] += 1
-                    st.rerun()
+            st.session_state.setdefault("__hist_page", 1)  # 1-based for humans
+
+            # Controls row
+            controls = st.columns([1, 1, 3, 4])
+            with controls[0]:
+                prev_clicked = st.button("◀ Prev", key="hist_prev", use_container_width=True,
+                                         disabled=st.session_state["__hist_page"] <= 1)
+            with controls[1]:
+                next_clicked = st.button("Next ▶", key="hist_next", use_container_width=True)
+            with controls[2]:
+                page_num = st.number_input("Page", min_value=1, step=1,
+                                           value=st.session_state["__hist_page"], key="__hist_page_input")
+            with controls[3]:
+                st.caption("Showing 20 per page")
+
+            # Apply control changes (no st.rerun()—Streamlit will re-execute anyway)
+            if prev_clicked:
+                st.session_state["__hist_page"] = max(1, st.session_state["__hist_page"] - 1)
+            if next_clicked:
+                st.session_state["__hist_page"] = st.session_state["__hist_page"] + 1
+            if page_num != st.session_state["__hist_page"]:
+                st.session_state["__hist_page"] = int(page_num)
 
             page = st.session_state["__hist_page"]
-            offset = page * PAGE_SIZE_HISTORY
+            offset = (page - 1) * PAGE_SIZE_HISTORY
 
             rows = []
             try:
@@ -578,12 +592,20 @@ def main():
             except Exception as e:
                 st.error(f"Could not load history: {e}")
 
-            if not rows and page > 0:
-                st.caption("No more results.")
+            # Disable "Next" button if fewer than page size returned
+            if len(rows) < PAGE_SIZE_HISTORY:
+                st.session_state["__hist_next_disabled"] = True
+            else:
+                st.session_state["__hist_next_disabled"] = False
+
+            if not rows and page > 1:
+                st.info("No more results.")
             elif not rows:
                 st.caption("No history yet for this account.")
             else:
                 df_hist = pd.DataFrame(rows)
+
+                # clickable park names
                 if {"park_name", "website"}.issubset(df_hist.columns):
                     df_hist["park_name"] = df_hist.apply(
                         lambda x: f"[{x['park_name']}]({x['website']})" if x.get("website") else x["park_name"],
@@ -624,9 +646,9 @@ def main():
                 except Exception as e:
                     st.warning(f"CSV export unavailable: {e}")
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # Controls
-    # -------------------------------------------------------------------------
+    # =========================================================================
     col1, col2 = st.columns(2)
     with col1:
         near_me = st.checkbox("Use my current area", value=True)
@@ -644,8 +666,7 @@ def main():
         user_key = st.session_state["user_key"]
         unlocked = bool(st.session_state.get("unlocked"))
 
-        # enforce hard cap on server side too
-        requested = min(int(requested), SEARCH_HARD_CAP)
+        requested = min(int(requested), SEARCH_HARD_CAP)  # hard cap
 
         allowed, is_unlim, remaining = (requested, True, -1) if unlocked else slice_by_trial(
             sb, user_key, int(requested)
