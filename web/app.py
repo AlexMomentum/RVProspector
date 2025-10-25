@@ -1,505 +1,754 @@
-# web/app.py
-"""
-RV Prospector - Enhanced with radial search pattern
-"""
 from __future__ import annotations
 
-import os
 import io
-import streamlit as st
+import os
+import pathlib
+import sys
+import traceback
+import uuid
+from typing import Any, Dict, List
+from datetime import datetime, timedelta
+
 import pandas as pd
-from pathlib import Path
-from datetime import datetime
-from typing import Optional
+import streamlit as st
+import extra_streamlit_components as stx
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from dotenv import load_dotenv
+# =============================================================================
+# Tunables / Perf (override via env without redeploy)
+# =============================================================================
+WORKERS = int(os.getenv("RVP_WORKERS", "20"))
+DEFAULT_NEAR_ME_RADIUS_M = int(os.getenv("RVP_RADIUS_M", "25000"))
+TARGET_QUERY_LIMIT = int(os.getenv("RVP_QUERY_LIMIT", "999"))
+PAGE_SLEEP_SECS = float(os.getenv("RVP_PAGE_SLEEP", "2.2"))
+PAD_HTTP_TIMEOUT = float(os.getenv("RVP_PAD_HTTP_TIMEOUT", "5.0"))
 
-# Local imports
-from db import (
-    get_client,
-    upsert_profile,
-    is_unlocked,
-    get_leads_used_today,
-    slice_by_trial,
-    fetch_history_place_ids,
-    list_history_rows,
-    list_history_all,
-    record_history,
-    DEMO_LIMIT,
-)
-from lead_sync import subscribe_mailchimp
-from places_search import RVParkFinder, format_place_for_db
+PAGE_SIZE_HISTORY = 20
+SEARCH_HARD_CAP   = 100
 
-# Load environment
-WEB_DIR = Path(__file__).resolve().parent
-ROOT_DIR = WEB_DIR.parent
-HOME = Path.home()
+# Expanding “near me” radii (meters). Can override via env/Secrets:
+# RVP_NEARME_RADII="25000,50000,100000,200000,400000,800000"
+NEARME_RADII = [int(x) for x in os.getenv(
+    "RVP_NEARME_RADII", "25000,50000,100000,200000,400000,800000"
+).split(",")]
 
-for p in (WEB_DIR / ".env", ROOT_DIR / ".env", HOME / ".rvprospector" / ".env"):
-    if Path(p).exists():
-        load_dotenv(dotenv_path=p, override=True)
+# Cookie security (True on HTTPS like Streamlit Cloud; False for localhost dev)
+COOKIE_SECURE   = os.getenv("RVP_COOKIE_SECURE", "false").strip().lower() == "true"
+COOKIE_SAMESITE = os.getenv("RVP_COOKIE_SAMESITE", "Lax")
 
-# Page config
-st.set_page_config(
-    page_title="RV Prospector - Find RV Parks Without Online Booking",
-    page_icon="🚐",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Custom CSS
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: bold;
-        color: #1f77b4;
-        text-align: center;
-        margin-bottom: 1rem;
+# =============================================================================
+# Secrets -> env (for Streamlit Cloud)
+# =============================================================================
+def _secrets_to_env():
+    mappings = {
+        "GOOGLE_PLACES_API_KEY": ["GOOGLE_PLACES_API_KEY", "GOOGLE_MAPS_API_KEY", "GOOGLE_API_KEY"],
+        "SUPABASE_URL": ["SUPABASE_URL"],
+        "SUPABASE_ANON_KEY": ["SUPABASE_ANON_KEY"],
+        "SUPABASE_SERVICE_ROLE_KEY": ["SUPABASE_SERVICE_ROLE_KEY", "SERVICE_ROLE_KEY"],
+        "SIGNUP_URL": ["SIGNUP_URL"],
+        "DONATE_URL": ["DONATE_URL"],
     }
-    .sub-header {
-        font-size: 1.2rem;
-        color: #666;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .info-box {
-        background-color: #f0f8ff;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 4px solid #1f77b4;
-        margin: 1rem 0;
-    }
-    .warning-box {
-        background-color: #fff3cd;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 4px solid #ffc107;
-        margin: 1rem 0;
-    }
-    .success-box {
-        background-color: #d4edda;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 4px solid #28a745;
-        margin: 1rem 0;
-    }
-</style>
-""", unsafe_allow_html=True)
+    for env_name, candidates in mappings.items():
+        if os.getenv(env_name):
+            continue
+        for key in candidates:
+            try:
+                val = st.secrets.get(key)
+            except Exception:
+                val = None
+            if val:
+                os.environ[env_name] = str(val)
+                break
+_secrets_to_env()
 
-# Initialize session state
-if 'email' not in st.session_state:
-    st.session_state.email = ""
-if 'authenticated' not in st.session_state:
-    st.session_state.authenticated = False
-if 'search_results' not in st.session_state:
-    st.session_state.search_results = []
-if 'history_data' not in st.session_state:
-    st.session_state.history_data = []
+SIGNUP_URL = os.getenv("SIGNUP_URL", "").strip()
+DONATE_URL = os.getenv("DONATE_URL", "").strip()
 
+# =============================================================================
+# Path setup so Python can find web/ and src/
+# =============================================================================
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT / "src"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
-def authenticate_user(email: str, full_name: Optional[str] = None) -> bool:
-    """Authenticate user and create/update profile."""
+# =============================================================================
+# ✅ Safe import of web.db (works whether web is a package or not)
+# =============================================================================
+def _import_web_db():
     try:
-        sb = get_client()
-        upsert_profile(sb, email, full_name)
-        st.session_state.email = email
-        st.session_state.authenticated = True
-        
-        # Subscribe to Mailchimp (non-blocking)
-        try:
-            subscribe_mailchimp(email)
-        except Exception:
-            pass  # Don't fail on Mailchimp errors
-        
-        return True
-    except Exception as e:
-        st.error(f"Authentication error: {e}")
-        return False
-
-
-def get_user_location() -> tuple[float, float] | None:
-    """Get user's location via browser geolocation or manual input."""
-    st.sidebar.subheader("📍 Your Location")
-    
-    location_method = st.sidebar.radio(
-        "How to set location:",
-        ["Use Current Location", "Enter Manually"],
-        key="location_method"
-    )
-    
-    if location_method == "Enter Manually":
-        col1, col2 = st.sidebar.columns(2)
-        with col1:
-            lat = st.number_input("Latitude", value=33.4484, format="%.4f", key="manual_lat")
-        with col2:
-            lng = st.number_input("Longitude", value=-112.0740, format="%.4f", key="manual_lng")
-        
-        if st.sidebar.button("Use This Location", key="use_manual"):
-            return (lat, lng)
-    else:
-        st.sidebar.info("🔄 Click below to get your current location from your browser")
-        
-        # JavaScript to get geolocation
-        location_js = """
-        <script>
-        function getLocation() {
-            if (navigator.geolocation) {
-                navigator.geolocation.getCurrentPosition(
-                    function(position) {
-                        // Send location to Streamlit
-                        const lat = position.coords.latitude;
-                        const lng = position.coords.longitude;
-                        
-                        // Store in localStorage for Streamlit to read
-                        localStorage.setItem('user_lat', lat);
-                        localStorage.setItem('user_lng', lng);
-                        
-                        alert('Location captured: ' + lat + ', ' + lng);
-                    },
-                    function(error) {
-                        alert('Error getting location: ' + error.message);
-                    }
-                );
-            } else {
-                alert('Geolocation not supported by this browser');
-            }
-        }
-        </script>
-        <button onclick="getLocation()" style="padding: 10px 20px; background: #1f77b4; color: white; border: none; border-radius: 5px; cursor: pointer;">
-            Get My Location
-        </button>
-        """
-        
-        st.sidebar.markdown(location_js, unsafe_allow_html=True)
-        
-        # Fallback: manual input after trying geolocation
-        st.sidebar.markdown("---")
-        st.sidebar.caption("Or enter manually if geolocation doesn't work:")
-        col1, col2 = st.sidebar.columns(2)
-        with col1:
-            lat = st.number_input("Latitude", value=33.4484, format="%.4f", key="fallback_lat")
-        with col2:
-            lng = st.number_input("Longitude", value=-112.0740, format="%.4f", key="fallback_lng")
-        
-        if st.sidebar.button("Use These Coordinates", key="use_fallback"):
-            return (lat, lng)
-    
-    return None
-
-
-def search_rv_parks(
-    origin_lat: float,
-    origin_lng: float,
-    max_radius_km: int,
-    max_results: int,
-    email: str
-) -> list[dict]:
-    """
-    Perform radial search for RV parks without online booking.
-    """
-    try:
-        sb = get_client()
-        
-        # Check limits
-        allowed, unlocked, remaining = slice_by_trial(sb, email, max_results)
-        
-        if allowed == 0:
-            st.warning(f"⚠️ You've reached your daily limit of {DEMO_LIMIT} leads. Upgrade for unlimited access!")
-            return []
-        
-        # Show user what they can get
-        if not unlocked and allowed < max_results:
-            st.info(f"ℹ️ Demo users can find up to {DEMO_LIMIT} leads per day. You have {remaining} searches remaining today.")
-        
-        # Get API key
-        api_key = os.getenv("GOOGLE_PLACES_API_KEY")
-        if not api_key:
-            st.error("❌ Google Places API key not configured. Please add GOOGLE_PLACES_API_KEY to your .env file.")
-            return []
-        
-        # Initialize finder
-        finder = RVParkFinder(api_key)
-        
-        # Show progress
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        status_text.text("🔍 Searching for RV parks in all directions...")
-        
-        # Perform search
-        keywords = ["RV park", "RV resort", "mobile home park", "trailer park"]
-        
-        results = finder.find_parks(
-            origin_lat=origin_lat,
-            origin_lng=origin_lng,
-            max_radius_km=max_radius_km,
-            step_km=40,  # Search every 40km
-            exclude_online_booking=True,  # Only parks WITHOUT online booking
-            keywords=keywords
-        )
-        
-        progress_bar.progress(0.7)
-        status_text.text("📊 Formatting results...")
-        
-        # Filter out duplicates from history
-        history_ids = fetch_history_place_ids(sb, email)
-        new_results = [r for r in results if r.get('place_id') not in history_ids]
-        
-        # Limit to allowed count
-        new_results = new_results[:allowed]
-        
-        progress_bar.progress(0.9)
-        status_text.text("💾 Saving to your account...")
-        
-        # Format for database
-        formatted_results = [
-            format_place_for_db(place, place.get('detected_keyword', ''))
-            for place in new_results
-        ]
-        
-        # Save to history
-        if formatted_results:
-            record_history(sb, email, formatted_results)
-        
-        progress_bar.progress(1.0)
-        status_text.text("✅ Search complete!")
-        
-        return formatted_results
-        
-    except Exception as e:
-        st.error(f"❌ Search error: {e}")
-        return []
-
-
-def display_results(results: list[dict]):
-    """Display search results in a nice format."""
-    if not results:
-        st.info("No results found. Try adjusting your search parameters.")
-        return
-    
-    st.success(f"✅ Found {len(results)} RV parks without online booking!")
-    
-    # Convert to DataFrame for display
-    df = pd.DataFrame(results)
-    
-    # Reorder columns for better display
-    display_cols = ['park_name', 'phone', 'website', 'city', 'state', 'detected_keyword']
-    available_cols = [col for col in display_cols if col in df.columns]
-    df_display = df[available_cols]
-    
-    # Show interactive table
-    st.dataframe(
-        df_display,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "park_name": st.column_config.TextColumn("Park Name", width="medium"),
-            "phone": st.column_config.TextColumn("Phone", width="small"),
-            "website": st.column_config.LinkColumn("Website", width="medium"),
-            "city": st.column_config.TextColumn("City", width="small"),
-            "state": st.column_config.TextColumn("State", width="small"),
-            "detected_keyword": st.column_config.TextColumn("Type", width="small"),
-        }
-    )
-    
-    # Download button
-    csv = df.to_csv(index=False)
-    st.download_button(
-        label="📥 Download as CSV",
-        data=csv,
-        file_name=f"rv_parks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
-
-
-def show_history_page():
-    """Display user's search history."""
-    st.markdown('<div class="main-header">📚 Search History</div>', unsafe_allow_html=True)
-    
-    try:
-        sb = get_client()
-        rows = list_history_rows(sb, st.session_state.email, limit=1000)
-        
-        if not rows:
-            st.info("No search history yet. Perform a search to get started!")
-            return
-        
-        st.success(f"You have {len(rows)} saved leads")
-        
-        # Convert to DataFrame
-        df = pd.DataFrame(rows)
-        
-        # Add date formatting
-        if 'created_at' in df.columns:
-            df['created_at'] = pd.to_datetime(df['created_at']).dt.strftime('%Y-%m-%d %H:%M')
-        
-        # Display
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True
-        )
-        
-        # Download all history
-        all_rows = list_history_all(sb, st.session_state.email)
-        if all_rows:
-            df_all = pd.DataFrame(all_rows)
-            csv_all = df_all.to_csv(index=False)
-            
-            st.download_button(
-                label="📥 Download All History as CSV",
-                data=csv_all,
-                file_name=f"rv_parks_history_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-    
-    except Exception as e:
-        st.error(f"Error loading history: {e}")
-
-
-def show_main_page():
-    """Main search interface."""
-    st.markdown('<div class="main-header">🚐 RV Prospector</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="sub-header">Find RV Parks & Mobile Home Communities Without Online Booking</div>',
-        unsafe_allow_html=True
-    )
-    
-    # Check account status
-    try:
-        sb = get_client()
-        unlocked = is_unlocked(sb, st.session_state.email)
-        used_today = get_leads_used_today(sb, st.session_state.email)
-        remaining = max(0, DEMO_LIMIT - used_today)
-        
-        if unlocked:
-            st.markdown(
-                '<div class="success-box">✨ <strong>Unlimited Account</strong> - Search as much as you want!</div>',
-                unsafe_allow_html=True
-            )
-        else:
-            st.markdown(
-                f'<div class="info-box">📊 Demo Account - {remaining} of {DEMO_LIMIT} daily searches remaining</div>',
-                unsafe_allow_html=True
-            )
+        import web.db as dbmod           # prefer package import
+        return dbmod
     except Exception:
         pass
-    
-    # Get location
-    location = get_user_location()
-    
-    # Search parameters
-    st.subheader("🔍 Search Parameters")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        max_radius = st.slider(
-            "Search Radius (miles)",
-            min_value=25,
-            max_value=200,
-            value=100,
-            step=25,
-            help="How far to search in all directions from your location"
+    import importlib.util, types
+    web_dir = ROOT / "web"
+    db_path = web_dir / "db.py"
+    if not db_path.exists():
+        raise RuntimeError(f"Could not find web/db.py at {db_path}")
+    spec = importlib.util.spec_from_file_location("web.db", db_path)
+    dbmod = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault("web", types.ModuleType("web"))
+    sys.modules["web.db"] = dbmod
+    assert spec.loader is not None
+    spec.loader.exec_module(dbmod)
+    return dbmod
+
+try:
+    db = _import_web_db()
+except Exception as e:
+    st.error(f"Failed to import web.db: {e.__class__.__name__}: {e}")
+    st.code("".join(traceback.format_exc()))
+    st.stop()
+
+# Re-export helpers present in your db.py
+get_client      = db.get_client
+is_unlocked     = db.is_unlocked
+upsert_profile  = db.upsert_profile
+record_history  = db.record_history
+increment_leads = db.increment_leads
+slice_by_trial  = db.slice_by_trial
+record_signup   = getattr(db, "record_signup", None)
+grant_unlimited = getattr(db, "grant_unlimited", None)
+list_history_rows = getattr(db, "list_history_rows", None)
+list_history_all  = getattr(db, "list_history_all", None)
+
+# If a deployed db.py didn’t implement pagination helpers, fall back
+if list_history_rows is None:
+    def list_history_rows(sb, user_key: str, limit: int = 1000, offset: int = 0):
+        return (
+            sb.table("history")
+            .select("created_at, park_place_id, park_name, phone, website, address, city, state, zip, source, detected_keyword, pad_count")
+            .ilike("email", user_key)
+            .order("created_at", desc=True)
+            .range(offset, offset + limit - 1)
+            .execute()
+            .data or []
         )
-        max_radius_km = int(max_radius * 1.60934)  # Convert to km
-    
-    with col2:
-        max_results = st.number_input(
-            "Maximum Results",
-            min_value=10,
-            max_value=500,
-            value=50,
-            step=10,
-            help="Maximum number of leads to find"
-        )
-    
-    # Search button
-    if st.button("🔍 Find RV Parks", type="primary", use_container_width=True):
-        if not location:
-            st.warning("⚠️ Please set your location first using the sidebar")
-        else:
-            lat, lng = location
-            st.info(f"📍 Searching from location: {lat:.4f}, {lng:.4f}")
-            
-            results = search_rv_parks(
-                origin_lat=lat,
-                origin_lng=lng,
-                max_radius_km=max_radius_km,
-                max_results=int(max_results),
-                email=st.session_state.email
+if list_history_all is None:
+    def list_history_all(sb, user_key: str) -> list[dict]:
+        out: list[dict] = []
+        page_size, offset = 1000, 0
+        while True:
+            resp = (
+                sb.table("history")
+                .select("created_at, park_place_id, park_name, phone, website, address, city, state, zip, source, detected_keyword, pad_count")
+                .ilike("email", user_key)
+                .order("created_at", desc=True)
+                .range(offset, offset + page_size - 1)
+                .execute()
             )
-            
-            st.session_state.search_results = results
-    
-    # Display results
-    if st.session_state.search_results:
-        st.markdown("---")
-        display_results(st.session_state.search_results)
+            rows = resp.data or []
+            out.extend(rows)
+            if len(rows) < page_size:
+                break
+            offset += page_size
+        return out
 
+# Import core after sys.path updates
+from rvprospector import core as c  # noqa: E402
 
+# =============================================================================
+# Page config + Sidebar
+# =============================================================================
+st.set_page_config(page_title="RV Prospector (Web)", page_icon="🗺️", layout="centered")
+
+st.sidebar.markdown("### ❤️ Support RV Prospector")
+st.sidebar.markdown("If this tool helps you, consider donating to keep it running:")
+if DONATE_URL:
+    st.sidebar.link_button("Donate", DONATE_URL)
+else:
+    st.sidebar.caption("Set DONATE_URL to show a donate button.")
+
+# =============================================================================
+# COOKIE + URL HELPERS
+# =============================================================================
+def _cm_set(cm: stx.CookieManager, key: str, value: str):
+    expires_at = datetime.utcnow() + timedelta(days=180)
+    try:
+        cm.set(key, value, expires_at=expires_at, key=key, path="/",
+               secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE)
+        return
+    except TypeError:
+        pass
+    try:
+        cm.set(key, value, expiry_days=180, key=key, path="/",
+               secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE)
+        return
+    except TypeError:
+        pass
+    cm.set(key, value)
+
+def _cm_delete(cm: stx.CookieManager, key: str):
+    try:
+        cm.delete(key, key=key, path="/")
+    except TypeError:
+        try:
+            cm.delete(key)
+        except Exception:
+            _cm_set(cm, key, "")
+
+def _ensure_guest_cookie(cm: stx.CookieManager, cookies: Dict[str, str]) -> str:
+    gid = cookies.get("rvp_guest_id")
+    if not gid:
+        gid = str(uuid.uuid4())
+        _cm_set(cm, "rvp_guest_id", gid)
+    return f"guest:{gid}"
+
+def _set_signed_in(cm: stx.CookieManager, email: str, unlocked: bool):
+    st.session_state["user_key"] = email
+    st.session_state["unlocked"] = bool(unlocked)
+    _cm_set(cm, "rvp_email", email)
+
+def _set_url_email(email: str):
+    try:
+        st.query_params.update({"u": email})
+    except Exception:
+        st.experimental_set_query_params(u=email)
+
+def _get_url_email() -> str | None:
+    try:
+        qp = st.query_params
+        return qp.get("u")
+    except Exception:
+        qp = st.experimental_get_query_params()
+        return qp.get("u", [None])[0]
+
+def _sign_out(cm: stx.CookieManager):
+    _cm_delete(cm, "rvp_email")
+    try:
+        st.query_params.update({"u": ""})
+    except Exception:
+        st.experimental_set_query_params(u="")
+    st.session_state.clear()
+    st.rerun()
+
+# =============================================================================
+# Location helpers
+# =============================================================================
+US_STATES = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas", "CA": "California", "CO": "Colorado",
+    "CT": "Connecticut", "DE": "Delaware", "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+    "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas", "KY": "Kentucky", "LA": "Louisiana",
+    "ME": "Maine", "MD": "Maryland", "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
+    "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada", "NH": "New Hampshire", "NJ": "New Jersey",
+    "NM": "New Mexico", "NY": "New York", "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
+    "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina", "SD": "South Dakota",
+    "TN": "Tennessee", "TX": "Texas", "UT": "Utah", "VT": "Vermont", "VA": "Virginia", "WA": "Washington",
+    "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming", "DC": "District of Columbia"
+}
+def normalize_location(raw: str) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if len(s) == 2 and s.upper() in US_STATES:
+        return f"{US_STATES[s.upper()]}, USA"
+    if s.title() in US_STATES.values() and "usa" not in s.lower():
+        return f"{s.title()}, USA"
+    return s
+
+# =============================================================================
+# Cached calls
+# =============================================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_place_details(api_key: str, pid: str) -> Dict[str, Any]:
+    return c.google_place_details(api_key, pid)
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_text_search(api_key: str, query: str, location_bias: str | None,
+                        pagetoken: str | None, latlng: tuple[float, float] | None,
+                        radius_m: int) -> dict:
+    return c.google_text_search(
+        api_key=api_key,
+        query=query,
+        location_bias=location_bias,
+        pagetoken=pagetoken,
+        latlng=latlng,
+        radius_m=radius_m,
+    )
+
+# =============================================================================
+# Strict category filter
+# =============================================================================
+ALLOW_KEYWORDS = (
+    "rv", "rv park", "rv resort", "motorhome", "trailer park",
+    "mobile home", "mobilehome", "manufactured home",
+)
+REJECT_KEYWORDS = (
+    "city park", "state park", "national park", "county park",
+    "dog park", "water park", "theme park", "amusement park",
+    "playground", "ball park", "sports park",
+    "storage", "repair", "sales", "dealers", "dealer", "parts",
+    "boat", "marina",
+)
+def _looks_like_rv_or_mhp(name: str, types: list[str] | None) -> bool:
+    nm = (name or "").lower()
+    tset = set((types or []))
+    if "rv_park" in tset:
+        return True
+    if ("park" in tset or "tourist_attraction" in tset) and not any(k in nm for k in ALLOW_KEYWORDS):
+        return False
+    if ("campground" in tset or "lodging" in tset):
+        return any(k in nm for k in ALLOW_KEYWORDS)
+    if any(k in nm for k in ALLOW_KEYWORDS):
+        return not any(bad in nm for bad in REJECT_KEYWORDS)
+    return False
+
+# =============================================================================
+# Search core (with expanding-radius “near me”)
+# =============================================================================
+def _generate_for_user(
+    api_key: str,
+    email: str,
+    location: str,
+    requested: int,
+    avoid_conglomerates: bool,
+    near_me: bool,
+    radius_m: int | None = None,
+) -> List[Dict[str, Any]]:
+    sb = get_client()
+
+    # Fetch already-seen place_ids for this user
+    try:
+        already_rows = (
+            sb.table("history").select("park_place_id").ilike("email", email).execute().data or []
+        )
+        already = {row.get("park_place_id") for row in already_rows if row.get("park_place_id")}
+    except Exception:
+        already = set()
+
+    seen: set[str] = set()
+    found: List[Dict[str, Any]] = []
+
+    def emit(msg: str):
+        st.session_state.setdefault("log", [])
+        st.session_state["log"].append(msg)
+
+    latlng = None
+    if near_me:
+        latlng = c.get_approx_location_via_ip()
+        if not latlng:
+            emit("[warn] Could not auto-detect location from IP; using manual location.")
+            near_me = False
+
+    OTA_HOST_SNIPPETS = (
+        "booking.com", "expedia", "hotels.com", "koa.com", "goodsam.com",
+        "campendium", "reserveamerica", "hipcamp", "rvshare", "roverpass",
+        "recreation.gov", "usace.army.mil",
+    )
+
+    def eval_place(pid: str, r_name_fallback: str, r_types: list[str] | None) -> Dict[str, Any] | None:
+        try:
+            det = _cached_place_details(api_key, pid)
+            name = det.get("name", r_name_fallback)
+            types = det.get("types", r_types) or r_types or []
+            if not _looks_like_rv_or_mhp(name, types):
+                return None
+
+            website = c._sanitize_url(det.get("website", ""))
+            phone = det.get("formatted_phone_number", "") or det.get("international_phone_number", "")
+            addr = det.get("formatted_address", "")
+            comps = {"city": "", "state": "", "zip": ""}
+            for comp in det.get("address_components", []) or []:
+                types_ac = comp.get("types", [])
+                if "locality" in types_ac:
+                    comps["city"] = comp.get("long_name", "")
+                if "administrative_area_level_1" in types_ac:
+                    comps["state"] = comp.get("short_name", "")
+                if "postal_code" in types_ac:
+                    comps["zip"] = comp.get("long_name", "")
+
+            if not website and not phone:
+                return None
+            if website and any(sn in website.lower() for sn in OTA_HOST_SNIPPETS):
+                return None
+            if avoid_conglomerates and c._is_conglomerate(name, website):
+                return None
+
+            try:
+                no_booking, booking_hit, pad_count = c.check_booking_and_pads(website, timeout_sec=PAD_HTTP_TIMEOUT)
+            except TypeError:
+                no_booking, booking_hit, pad_count = c.check_booking_and_pads(website)
+
+            if not (no_booking and (pad_count is None or pad_count >= c.PAD_MIN)):
+                return None
+
+            return {
+                "park_place_id": pid,
+                "park_name": name,
+                "website": website,
+                "phone": phone,
+                "address": addr,
+                "city": comps["city"],
+                "state": comps["state"],
+                "zip": comps["zip"],
+                "pad_count": pad_count or "",
+                "source": "Google Places",
+            }
+        except Exception as e:
+            emit(f"[warn] skipped place {pid}: {e}")
+            return None
+
+    # Plan: one radius for manual location; expanding radii for near-me
+    radii_plan = (NEARME_RADII if near_me else [int(radius_m or DEFAULT_NEAR_ME_RADIUS_M)])
+
+    for radius in radii_plan:
+        if len(found) >= requested:
+            break
+
+        pretty_km = round(radius / 1000)
+        where = f"your current area (+{pretty_km} km)" if near_me else location
+        emit(f"[info] Radius sweep: {pretty_km} km — searching near {where}")
+
+        for idx, query in enumerate(c.TARGET_QUERIES):
+            if idx >= TARGET_QUERY_LIMIT or len(found) >= requested:
+                break
+
+            token = None
+            while True:
+                if len(found) >= requested:
+                    break
+                try:
+                    data = _cached_text_search(
+                        api_key=api_key,
+                        query=query,
+                        location_bias=None if near_me else location,
+                        pagetoken=token,
+                        latlng=latlng if near_me else None,
+                        radius_m=radius,
+                    )
+                except Exception as e:
+                    emit(f"[error] google_text_search failed: {e}")
+                    break
+
+                results = data.get("results", []) or []
+                token = data.get("next_page_token")
+
+                candidates: list[tuple[str, str, list[str] | None]] = []
+                for r in results:
+                    if len(found) >= requested:
+                        break
+                    pid = r.get("place_id")
+                    if not pid or pid in seen or pid in already:
+                        continue
+                    r_types = r.get("types", []) or []
+                    r_name = r.get("name", "")
+                    if not _looks_like_rv_or_mhp(r_name, r_types):
+                        continue
+                    seen.add(pid)
+                    candidates.append((pid, r_name, r_types))
+
+                if candidates:
+                    emit(f"[info] Checking {len(candidates)} candidates (parallel)… found so far: {len(found)}/{requested}")
+                    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                        futs = [ex.submit(eval_place, pid, nm, tps) for (pid, nm, tps) in candidates]
+                        for fut in as_completed(futs):
+                            row = None
+                            try:
+                                row = fut.result()
+                            except Exception as e:
+                                emit(f"[warn] worker error: {e}")
+                            if row:
+                                found.append(row)
+                                if len(found) >= requested:
+                                    break
+
+                if not token or len(found) >= requested:
+                    break
+                time.sleep(PAGE_SLEEP_SECS)  # next_page_token warm-up
+
+        if len(found) < requested and near_me:
+            emit(f"[info] Radius {pretty_km} km complete; expanding…")
+
+    emit(f"[info] Completed. Found {len(found)} new parks.")
+    return found
+
+# =============================================================================
+# Responsive table helper
+# =============================================================================
+def _render_responsive_table(df: pd.DataFrame, order: list[str], labels: dict[str, str]) -> None:
+    df = df[[c for c in order if c in df.columns]].copy()
+    thead = "".join(f"<th>{labels.get(c,c)}</th>" for c in df.columns)
+    rows_html = []
+    for _, row in df.iterrows():
+        tds = []
+        for c in df.columns:
+            val = "" if pd.isna(row[c]) else str(row[c])
+            # Do not escape so <a> renders
+            tds.append(f'<td data-label="{labels.get(c,c)}">{val}</td>')
+        rows_html.append(f"<tr>{''.join(tds)}</tr>")
+    html = f"""
+    <table class="rvp-table">
+      <thead><tr>{thead}</tr></thead>
+      <tbody>{''.join(rows_html)}</tbody>
+    </table>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+
+# =============================================================================
+# App
+# =============================================================================
 def main():
-    """Main app entry point."""
-    
-    # Sidebar for authentication
-    with st.sidebar:
-        st.title("🚐 RV Prospector")
-        
-        if not st.session_state.authenticated:
-            st.subheader("Sign In / Sign Up")
-            
-            email = st.text_input("Email Address", key="login_email")
-            full_name = st.text_input("Full Name (optional)", key="login_name")
-            
-            if st.button("Continue", use_container_width=True):
-                if email:
-                    if authenticate_user(email, full_name):
-                        st.success("✅ Signed in successfully!")
-                        st.rerun()
-                else:
-                    st.error("Please enter your email")
-        else:
-            st.success(f"✅ Signed in as: {st.session_state.email}")
-            if st.button("Sign Out", use_container_width=True):
-                st.session_state.authenticated = False
-                st.session_state.email = ""
-                st.rerun()
-            
-            st.markdown("---")
-    
-    # Main content
-    if not st.session_state.authenticated:
-        st.markdown('<div class="main-header">🚐 Welcome to RV Prospector</div>', unsafe_allow_html=True)
-        st.markdown(
-            '<div class="info-box">'
-            '<h3>Find RV Parks Without Online Booking</h3>'
-            '<p>Our advanced search system scans in all directions from your location to find:</p>'
-            '<ul>'
-            '<li>✅ RV Parks without online booking systems</li>'
-            '<li>✅ Mobile Home Communities</li>'
-            '<li>✅ Contact information (phone, website)</li>'
-            '<li>✅ Full addresses and details</li>'
-            '</ul>'
-            '<p><strong>Please sign in using the sidebar to get started.</strong></p>'
-            '</div>',
-            unsafe_allow_html=True
-        )
-    else:
-        # Navigation
-        page = st.sidebar.radio(
-            "Navigation",
-            ["🔍 Search", "📚 History"],
-            key="nav"
-        )
-        
-        if page == "🔍 Search":
-            show_main_page()
-        else:
-            show_history_page()
+    st.markdown("<h1>🗺️ RV Prospector</h1>", unsafe_allow_html=True)
+    st.caption("Find RV parks without online booking — Demo gives you 10 new leads per day.")
 
+    # ---- responsive table CSS (desktop -> mobile cards) ----
+    st.markdown("""
+    <style>
+    .rvp-table { width:100%; border-collapse: collapse; table-layout: fixed; }
+    .rvp-table th, .rvp-table td { padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.08); vertical-align: top; word-wrap: break-word; overflow-wrap: anywhere; }
+    .rvp-table th { text-align: left; font-weight: 600; }
+    .rvp-table td a { text-decoration: underline; }
+    @media (max-width: 760px) {
+      .rvp-table thead { display: none; }
+      .rvp-table, .rvp-table tbody, .rvp-table tr, .rvp-table td { display: block; width: 100%; }
+      .rvp-table tr { margin: 0 0 12px 0; padding: 12px; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; }
+      .rvp-table td { border: none; padding: 4px 0; }
+      .rvp-table td::before {
+         content: attr(data-label);
+         display: block;
+         font-size: 12px; opacity: .7; margin-bottom: 2px;
+      }
+      .rvp-table td[data-label="Park"] { font-weight: 600; font-size: 16px; }
+      .rvp-table td[data-label="Park"]::before { display: none; }
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    cm = stx.CookieManager(key="rvp_cookies")
+    sb = get_client()
+    st.session_state.setdefault("log", [])
+
+    cookies = cm.get_all()
+    if cookies is None:
+        st.stop()
+
+    # ---------- Identity init (cookie OR URL param) ----------
+    if "user_key" not in st.session_state:
+        saved_email = cookies.get("rvp_email") or _get_url_email()
+        if saved_email:
+            prior = bool(st.session_state.get("unlocked"))
+            try:
+                unlocked_db = bool(is_unlocked(sb, saved_email))
+            except Exception:
+                unlocked_db = False
+            _set_signed_in(cm, saved_email, prior or unlocked_db)
+        else:
+            st.session_state["user_key"] = _ensure_guest_cookie(cm, cookies)
+            st.session_state["unlocked"] = False
+
+    # ------------------------ Account box ------------------------
+    with st.expander("🔐 Sign In / Account", expanded=False):
+        is_guest = str(st.session_state["user_key"]).startswith("guest:")
+
+        if is_guest:
+            with st.form("login", border=False):
+                email = st.text_input("Email (optional, for saving your history)")
+                full_name = st.text_input("Full Name (optional)")
+                submitted = st.form_submit_button("Sign In")
+
+            if submitted and email and "@" in email:
+                try:
+                    upsert_profile(get_client(), email, full_name or None)
+                    unlocked_now = bool(is_unlocked(get_client(), email))
+                    _set_signed_in(cm, email, unlocked_now)
+                    _set_url_email(email)
+                    st.success(f"✅ Signed in as {email} ({'Unlimited' if unlocked_now else 'Demo user'})")
+                    st.rerun()
+                except Exception as e:
+                    st.warning(f"Login issue: {e}")
+        else:
+            user_email = str(st.session_state["user_key"])
+            session_unlocked = bool(st.session_state.get("unlocked"))
+            try:
+                db_unlocked = bool(is_unlocked(get_client(), user_email))
+            except Exception:
+                db_unlocked = False
+            current_unlocked = session_unlocked or db_unlocked
+            _set_signed_in(cm, user_email, current_unlocked)
+
+            st.write(
+                f"Signed in as **{user_email}** "
+                f"({'Unlimited' if st.session_state.get('unlocked') else 'Demo user'})"
+            )
+
+            if not st.session_state.get("unlocked"):
+                if st.button("Activate Unlimited"):
+                    try:
+                        upsert_profile(get_client(), user_email, None)
+                        if grant_unlimited:
+                            grant_unlimited(get_client(), user_email, None)
+                        else:
+                            get_client().table("profiles").upsert({"email": user_email, "unlocked": True}).execute()
+                        _set_signed_in(cm, user_email, True)
+                        _set_url_email(user_email)
+                        st.success("Unlimited activated for your account.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to activate unlimited: {e}")
+
+            if st.button("Sign out"):
+                _sign_out(cm)
+
+    # API key
+    api_key = c.load_api_key()
+    if not api_key:
+        st.error("Server misconfigured: missing API key.")
+        st.stop()
+
+    st.divider()
+
+    # -------------------------------------------------------------------------
+    # 📜 View My Search History (responsive + real links + centered pager only)
+    # -------------------------------------------------------------------------
+    with st.expander("📜 View My Search History", expanded=False):
+        user_key = str(st.session_state.get("user_key", "")) or ""
+        if not user_key:
+            st.info("Sign in or continue as guest to build your history.")
+        else:
+            st.session_state.setdefault("__hist_page", 1)  # 1-based
+            page = st.session_state["__hist_page"]
+            offset = (page - 1) * PAGE_SIZE_HISTORY
+
+            rows_plus = []
+            try:
+                rows_plus = list_history_rows(get_client(), user_key, limit=PAGE_SIZE_HISTORY + 1, offset=offset)
+            except Exception as e:
+                st.error(f"Could not load history: {e}")
+
+            rows = rows_plus[:PAGE_SIZE_HISTORY]
+            has_next = len(rows_plus) > PAGE_SIZE_HISTORY
+
+            if not rows and page > 1:
+                st.info("No more results on this page. Try going back a page.")
+            elif not rows:
+                st.caption("No history yet for this account.")
+            else:
+                df_hist = pd.DataFrame(rows)
+
+                # Clickable park names: real <a> tags
+                if {"park_name", "website"}.issubset(df_hist.columns):
+                    def _anchor(r):
+                        name = (r.get("park_name") or "").replace('"', "&quot;")
+                        url  = (r.get("website") or "").replace('"', "&quot;")
+                        return f'<a href="{url}" target="_blank" rel="noopener noreferrer">{name}</a>' if url else name
+                    df_hist["park_name"] = df_hist.apply(_anchor, axis=1)
+
+                order = ["created_at", "park_name", "phone", "address", "city", "state", "zip"]
+                labels = {"created_at":"Date","park_name":"Park","phone":"Phone","address":"Address","city":"City","state":"State","zip":"ZIP"}
+
+                if "created_at" in df_hist.columns:
+                    try:
+                        df_hist["created_at"] = pd.to_datetime(df_hist["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
+                    except Exception:
+                        pass
+
+                _render_responsive_table(df_hist, order, labels)
+
+                # Centered pager: ‹ Page N ›
+                st.divider()
+                left, middle, right = st.columns([1, 2, 1])
+                with middle:
+                    c1, c2, c3 = st.columns([1, 2, 1])
+                    prev_clicked = c1.button("‹", key="hist_prev", use_container_width=True, disabled=(page <= 1))
+                    c2.markdown(f"<div style='text-align:center;padding:6px 0'>Page <strong>{page}</strong></div>", unsafe_allow_html=True)
+                    next_clicked = c3.button("›", key="hist_next", use_container_width=True, disabled=(not has_next))
+                if prev_clicked and page > 1:
+                    st.session_state["__hist_page"] = page - 1
+                if next_clicked and has_next:
+                    st.session_state["__hist_page"] = page + 1
+
+                # CSV export
+                try:
+                    all_rows = list_history_all(get_client(), user_key)
+                    df_all = pd.DataFrame(all_rows)
+                    csv = df_all.to_csv(index=False)
+                    st.download_button(
+                        "⬇️ Download My Entire History (CSV)",
+                        data=csv,
+                        file_name="rvprospector_history.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+                except Exception as e:
+                    st.warning(f"CSV export unavailable: {e}")
+
+    # =========================================================================
+    # Controls
+    # =========================================================================
+    col1, col2 = st.columns(2)
+    with col1:
+        near_me = st.checkbox("Use my current area", value=True)
+    with col2:
+        avoid_conglom = st.checkbox("Avoid chains/conglomerates", value=True)
+
+    st.caption("🌎 Enter a location to override your area.")
+    raw_loc = st.text_input("Location (optional)", placeholder="e.g. Phoenix, AZ or UT")
+    location = normalize_location(raw_loc)
+    use_near_me = not bool(location)
+
+    requested = st.number_input("How many parks to find? (max 100)", 1, SEARCH_HARD_CAP, 10)
+
+    if st.button("🚀 Find RV Parks"):
+        user_key = st.session_state["user_key"]
+        unlocked = bool(st.session_state.get("unlocked"))
+        requested = min(int(requested), SEARCH_HARD_CAP)
+
+        allowed, is_unlim, remaining = (requested, True, -1) if unlocked else slice_by_trial(
+            sb, user_key, int(requested)
+        )
+
+        if not is_unlim and allowed <= 0:
+            st.warning("Daily demo limit reached.")
+            st.stop()
+
+        with st.status("Searching for parks...", expanded=True) as status:
+            st.session_state["log"] = []
+            rows = _generate_for_user(
+                api_key=api_key,
+                email=user_key,
+                location=location or "",
+                requested=int(allowed),
+                avoid_conglomerates=avoid_conglom,
+                near_me=use_near_me,
+                radius_m=DEFAULT_NEAR_ME_RADIUS_M if use_near_me else None,
+            )
+            record_history(sb, user_key, rows)
+            if not is_unlim and not str(user_key).startswith("guest:"):
+                increment_leads(sb, user_key, len(rows))
+            status.update(label="✅ Done", state="complete")
+
+        if not rows:
+            st.info("No new parks found.")
+            st.stop()
+
+        # ---------------------- Results (clickable names) ----------------------
+        df = pd.DataFrame(rows)
+        if {"website", "park_name"}.issubset(df.columns):
+            df["park_name"] = df.apply(
+                lambda x: f"[{x['park_name']}]({x['website']})" if x["website"] else x["park_name"],
+                axis=1,
+            )
+        show_cols = ["park_name", "phone", "address", "city", "state", "zip"]
+        show_cols = [c for c in show_cols if c in df.columns]
+        df = df[show_cols].copy()
+        df.insert(0, "#", range(1, len(df) + 1))
+
+        st.subheader(f"Results ({len(df)})")
+        try:
+            st.markdown(df.to_markdown(index=False), unsafe_allow_html=True)
+        except Exception:
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+        buf = io.StringIO()
+        pd.DataFrame(rows).drop(columns=["park_place_id"], errors="ignore").to_csv(buf, index=False)
+        st.download_button("⬇️ Download CSV", buf.getvalue(), "rv_parks.csv", "text/csv")
+
+        with st.expander("Run Log"):
+            st.code("\n".join(st.session_state.get("log", [])))
 
 if __name__ == "__main__":
     main()
