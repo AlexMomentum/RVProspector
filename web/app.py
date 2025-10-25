@@ -8,6 +8,7 @@ import sys
 import traceback
 import uuid
 from typing import Any, Dict, List
+from datetime import datetime, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -15,8 +16,15 @@ import extra_streamlit_components as stx
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-
 # -----------------------------------------------------------------------------
+# Tunables / Perf
+# -----------------------------------------------------------------------------
+# Increase on beefier hosts (12–24 is fine on Streamlit Cloud Pro; test & tune)
+WORKERS = int(os.getenv("RVP_WORKERS", "12"))
+# Default search radius when "Use my current area" is enabled
+DEFAULT_NEAR_ME_RADIUS_M = int(os.getenv("RVP_RADIUS_M", "30000"))
+
+# ----------------------------------------------------------------------------- 
 # Secrets -> env (for Streamlit Cloud)
 # -----------------------------------------------------------------------------
 def _secrets_to_env():
@@ -46,7 +54,7 @@ _secrets_to_env()
 SIGNUP_URL = os.getenv("SIGNUP_URL", "").strip()
 DONATE_URL = os.getenv("DONATE_URL", "").strip()
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- 
 # Path setup so Python can find web/ and src/
 # -----------------------------------------------------------------------------
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -56,7 +64,7 @@ if str(ROOT) not in sys.path:
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- 
 # ✅ Single, robust import of web.db
 # -----------------------------------------------------------------------------
 def _import_web_db():
@@ -103,7 +111,7 @@ grant_unlimited = getattr(db, "grant_unlimited", None)
 # Import core AFTER paths are set
 from rvprospector import core as c  # noqa: E402
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- 
 # Page config + Sidebar
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="RV Prospector (Web)", page_icon="🗺️", layout="centered")
@@ -115,27 +123,44 @@ if DONATE_URL:
 else:
     st.sidebar.caption("Set DONATE_URL to show a donate button.")
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- 
 # Cookie + session helpers
 # -----------------------------------------------------------------------------
+def _cm_set(cm: stx.CookieManager, key: str, value: str):
+    """
+    Sets a cookie with a 6-month expiry. Falls back gracefully if this version
+    of extra_streamlit_components doesn't support expires_at.
+    """
+    try:
+        cm.set(key, value, expires_at=(datetime.utcnow() + timedelta(days=180)))
+    except TypeError:
+        cm.set(key, value)
+
+def _cm_delete(cm: stx.CookieManager, key: str):
+    try:
+        cm.delete(key)
+    except Exception:
+        # Older versions may not implement delete; overwrite to expire
+        _cm_set(cm, key, "")
+
 def _ensure_guest_cookie(cm: stx.CookieManager, cookies: Dict[str, str]) -> str:
     gid = cookies.get("rvp_guest_id")
     if not gid:
         gid = str(uuid.uuid4())
-        cm.set("rvp_guest_id", gid)
+        _cm_set(cm, "rvp_guest_id", gid)
     return f"guest:{gid}"
 
 def _set_signed_in(cm: stx.CookieManager, email: str, unlocked: bool):
     st.session_state["user_key"] = email
     st.session_state["unlocked"] = bool(unlocked)
-    cm.set("rvp_email", email)
+    _cm_set(cm, "rvp_email", email)
 
 def _sign_out(cm: stx.CookieManager):
-    cm.delete("rvp_email")
+    _cm_delete(cm, "rvp_email")
     st.session_state.clear()
     st.rerun()
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- 
 # Location helpers
 # -----------------------------------------------------------------------------
 US_STATES = {
@@ -160,7 +185,14 @@ def normalize_location(raw: str) -> str:
         return f"{s.title()}, USA"
     return s
 
+# ----------------------------------------------------------------------------- 
+# Cached calls
 # -----------------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_place_details(api_key: str, pid: str) -> Dict[str, Any]:
+    return c.google_place_details(api_key, pid)
+
+# ----------------------------------------------------------------------------- 
 # Search core
 # -----------------------------------------------------------------------------
 def _generate_for_user(
@@ -170,13 +202,15 @@ def _generate_for_user(
     requested: int,
     avoid_conglomerates: bool,
     near_me: bool,
-    radius_m: int = 50_000,
+    radius_m: int | None = None,
 ) -> List[Dict[str, Any]]:
     sb = get_client()
     already = fetch_history_place_ids(sb, email)
     seen: set[str] = set()
     found: List[Dict[str, Any]] = []
     checked = 0
+
+    radius_m = int(radius_m or DEFAULT_NEAR_ME_RADIUS_M)
 
     def emit(msg: str):
         st.session_state.setdefault("log", [])
@@ -190,11 +224,17 @@ def _generate_for_user(
             emit("[warn] Could not auto-detect location from IP; using manual location.")
             near_me = False
 
+    # quick OTA/chain filter to avoid expensive checks
+    OTA_HOST_SNIPPETS = (
+        "booking.com", "expedia", "hotels.com", "koa.com", "goodsam.com",
+        "campendium", "reserveamerica", "hipcamp", "rvshare", "roverpass",
+    )
+
     # ---------- worker to evaluate one candidate ----------
     def eval_place(pid: str, r_name_fallback: str) -> Dict[str, Any] | None:
         nonlocal checked
         try:
-            det = c.google_place_details(api_key, pid)
+            det = _cached_place_details(api_key, pid)
             name = det.get("name", r_name_fallback)
             website = c._sanitize_url(det.get("website", ""))
             phone = det.get("formatted_phone_number", "") or det.get("international_phone_number", "")
@@ -208,6 +248,13 @@ def _generate_for_user(
                     comps["state"] = comp.get("short_name", "")
                 if "postal_code" in types:
                     comps["zip"] = comp.get("long_name", "")
+
+            if not website:
+                return None
+
+            lower_site = website.lower()
+            if any(sn in lower_site for sn in OTA_HOST_SNIPPETS):
+                return None
 
             if avoid_conglomerates and c._is_conglomerate(name, website):
                 return None
@@ -278,8 +325,7 @@ def _generate_for_user(
 
             if candidates:
                 emit(f"[info] Checking {len(candidates)} candidates (parallel)… found so far: {len(found)}/{requested}")
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-                with ThreadPoolExecutor(max_workers=8) as ex:
+                with ThreadPoolExecutor(max_workers=WORKERS) as ex:
                     futs = [ex.submit(eval_place, pid, nm) for pid, nm in candidates]
                     for fut in as_completed(futs):
                         try:
@@ -304,8 +350,7 @@ def _generate_for_user(
     emit(f"[info] Completed. Found {len(found)} new parks.")
     return found
 
-
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- 
 # Demo-limit modal/dialog
 # -----------------------------------------------------------------------------
 def _render_demo_limit_body(sb, cm):
@@ -360,7 +405,7 @@ def show_demo_limit(sb, cm):
             _render_demo_limit_body(sb, cm)
         _dlg()
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- 
 # App
 # -----------------------------------------------------------------------------
 def main():
@@ -452,10 +497,10 @@ def main():
         st.stop()
 
     st.divider()
-        # -------------------------------------------------------------------------
+
+    # -------------------------------------------------------------------------
     # 📜 History (view & CSV export)
     # -------------------------------------------------------------------------
-    st.divider()
     with st.expander("📜 View My Search History", expanded=False):
         user_key = str(st.session_state.get("user_key", "")) or ""
         if not user_key:
@@ -490,11 +535,10 @@ def main():
                         pass
 
                 st.write(f"Total saved leads: **{len(df_hist)}**")
-                # Prefer markdown if tabulate is present, else fallback to dataframe
                 try:
-                    st.markdown(df_view.to_markdown(index=False), unsafe_allow_html=True)
-                except Exception:
                     st.dataframe(df_view, use_container_width=True, hide_index=True)
+                except Exception:
+                    st.markdown(df_view.to_markdown(index=False), unsafe_allow_html=True)
 
                 # Full CSV download (all rows, all columns)
                 try:
@@ -547,6 +591,7 @@ def main():
                 requested=int(allowed),
                 avoid_conglomerates=avoid_conglom,
                 near_me=use_near_me,
+                radius_m=DEFAULT_NEAR_ME_RADIUS_M if use_near_me else None,
             )
             record_history(sb, user_key, rows)
             if not is_unlim and not str(user_key).startswith("guest:"):
@@ -573,9 +618,9 @@ def main():
 
         st.subheader(f"Results ({len(df)})")
         try:
-            st.markdown(df.to_markdown(index=False), unsafe_allow_html=True)
-        except Exception:
             st.dataframe(df, use_container_width=True, hide_index=True)
+        except Exception:
+            st.markdown(df.to_markdown(index=False), unsafe_allow_html=True)
 
         # CSV download
         buf = io.StringIO()
