@@ -1,5 +1,3 @@
-
-# web/app.py
 from __future__ import annotations
 
 import io
@@ -247,6 +245,7 @@ US_STATES = {
     "TN": "Tennessee", "TX": "Texas", "UT": "Utah", "VT": "Vermont", "VA": "Virginia", "WA": "Washington",
     "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming", "DC": "District of Columbia"
 }
+
 def normalize_location(raw: str) -> str:
     s = (raw or "").strip()
     if not s:
@@ -440,9 +439,9 @@ def _generate_for_user(
 def _render_demo_limit_body(sb, cm):
     st.markdown("### **Daily Demo Limit Reached**")
     st.write(
-        "You’ve reached your 10 demo leads for today.\n\n"
-        "RV Prospector is free to try — you’ll get 10 more leads tomorrow!\n\n"
-        "If you’d like unlimited access, please sign up below.\n"
+        "You’ve reached your 10 demo leads for today."
+        "RV Prospector is free to try — you’ll get 10 more leads tomorrow!"
+        "If you’d like unlimited access, please sign up below."
         "Your support keeps this project alive ❤️"
     )
     cols = st.columns(2)
@@ -629,7 +628,7 @@ def main():
     st.divider()
 
     # -------------------------------------------------------------------------
-    # 📜 View My Search History (responsive + real links + centered pager only)
+    # 📜 View My Search History (responsive + real links + robust pager)
     # -------------------------------------------------------------------------
     with st.expander("📜 View My Search History", expanded=False):
         user_key = str(st.session_state.get("user_key", "")) or ""
@@ -637,7 +636,7 @@ def main():
             st.info("Sign in or continue as guest to build your history.")
         else:
             st.session_state.setdefault("__hist_page", 1)  # 1-based
-            page = st.session_state["__hist_page"]
+            page = int(st.session_state["__hist_page"]) or 1
             offset = (page - 1) * PAGE_SIZE_HISTORY
 
             # Fetch PAGE_SIZE+1 to know if a next page exists
@@ -688,22 +687,35 @@ def main():
 
                 _render_responsive_table(df_hist, order, labels)
 
-                # Bottom controls: compact centered pager ([-] Page N [+]) with correct directions
+                # --- Robust pager with callbacks (prevents sticky jumps) ---
+                def _hist_go_prev():
+                    st.session_state["__hist_page"] = max(1, int(st.session_state["__hist_page"]) - 1)
+                def _hist_go_next():
+                    st.session_state["__hist_page"] = int(st.session_state["__hist_page"]) + 1
+
                 st.divider()
                 left, middle, right = st.columns([1, 2, 1])
+                with left:
+                    st.button("◀ Prev", key="hist_prev_btn", use_container_width=True,
+                              disabled=(page <= 1), on_click=_hist_go_prev)
                 with middle:
-                    bcol1, bcol2, bcol3 = st.columns([1, 2, 1])
+                    c_a, c_b, c_c = st.columns([1,2,1])
+                    c_b.markdown(
+                        f"<div style='text-align:center;padding:8px 0'>Page <strong>{page}</strong></div>",
+                        unsafe_allow_html=True,
+                    )
+                with right:
+                    st.button("Next ▶", key="hist_next_btn", use_container_width=True,
+                              disabled=(not has_next), on_click=_hist_go_next)
 
-                    prev_clicked = bcol1.button("−", key="hist_page_minus", use_container_width=True, disabled=(page <= 1))
-                    # read-only page label (keeps state stable across reruns)
-                    bcol2.markdown(f"<div style='text-align:center;padding:6px 0'>Page <strong>{page}</strong></div>", unsafe_allow_html=True)
-                    next_clicked = bcol3.button("+", key="hist_page_plus", use_container_width=True, disabled=(not has_next))
-
-                # Apply clicks AFTER layout so Streamlit doesn't fight the widget state
-                if prev_clicked and page > 1:
-                    st.session_state["__hist_page"] = page - 1
-                if next_clicked and has_next:
-                    st.session_state["__hist_page"] = page + 1
+                # Optional: quick jump input (collapsed label to save space)
+                j1, j2, j3 = st.columns([1.5, 1, 1.5])
+                with j2:
+                    jump = st.number_input("Go to page", min_value=1, step=1, value=page,
+                                           key="hist_jump", label_visibility="collapsed")
+                if jump != page:
+                    st.session_state["__hist_page"] = int(jump)
+                    st.rerun()
 
                 # CSV (all history)
                 try:
@@ -794,7 +806,7 @@ def main():
         st.download_button("⬇️ Download CSV", buf.getvalue(), "rv_parks.csv", "text/csv")
 
         with st.expander("Run Log"):
-            st.code("\n".join(st.session_state.get("log", [])))
+            st.code("".join(st.session_state.get("log", [])))
 
 if __name__ == "__main__":
     main()
