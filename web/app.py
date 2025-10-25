@@ -182,6 +182,7 @@ def _generate_for_user(
         st.session_state.setdefault("log", [])
         st.session_state["log"].append(msg)
 
+    # near-me lat/lng
     latlng = None
     if near_me:
         latlng = c.get_approx_location_via_ip()
@@ -189,7 +190,7 @@ def _generate_for_user(
             emit("[warn] Could not auto-detect location from IP; using manual location.")
             near_me = False
 
-    # ---------- helper to evaluate one candidate place_id ----------
+    # ---------- worker to evaluate one candidate ----------
     def eval_place(pid: str, r_name_fallback: str) -> Dict[str, Any] | None:
         nonlocal checked
         try:
@@ -211,13 +212,18 @@ def _generate_for_user(
             if avoid_conglomerates and c._is_conglomerate(name, website):
                 return None
 
-            # make sure the website scrape can't hang forever
-            no_booking, booking_hit, pad_count = c.check_booking_and_pads(website, timeout_sec=7)
+            # Call booking checker with a timeout if supported, else fallback
+            try:
+                no_booking, booking_hit, pad_count = c.check_booking_and_pads(website, timeout_sec=7)
+            except TypeError:
+                # old signature (no timeout)
+                no_booking, booking_hit, pad_count = c.check_booking_and_pads(website)
+
             qualifies = no_booking and (pad_count is None or pad_count >= c.PAD_MIN)
             if not qualifies:
                 return None
 
-            row = {
+            return {
                 "park_place_id": pid,
                 "park_name": name,
                 "website": website,
@@ -229,29 +235,37 @@ def _generate_for_user(
                 "pad_count": pad_count or "",
                 "source": "Google Places",
             }
-            return row
+        except Exception as e:
+            # Log but don’t kill the batch
+            emit(f"[warn] skipped place {pid}: {e}")
+            return None
         finally:
             checked += 1
 
-    # --------------------------------------------------------------
+    # ---------- main search ----------
     for query in c.TARGET_QUERIES:
         where = "your current area" if near_me else location
         emit(f"[info] Searching '{query}' near {where}")
 
         token = None
         while True:
-            data = c.google_text_search(
-                api_key=api_key,
-                query=query,
-                location_bias=None if near_me else location,
-                pagetoken=token,
-                latlng=latlng if near_me else None,
-                radius_m=radius_m,
-            )
-            results = data.get("results", [])
+            try:
+                data = c.google_text_search(
+                    api_key=api_key,
+                    query=query,
+                    location_bias=None if near_me else location,
+                    pagetoken=token,
+                    latlng=latlng if near_me else None,
+                    radius_m=radius_m,
+                )
+            except Exception as e:
+                emit(f"[error] google_text_search failed: {e}")
+                break
+
+            results = data.get("results", []) or []
             token = data.get("next_page_token")
 
-            # Filter new candidates we haven't seen/already saved
+            # collect fresh candidates
             candidates: list[tuple[str, str]] = []
             for r in results:
                 if len(found) >= requested:
@@ -263,11 +277,16 @@ def _generate_for_user(
                 candidates.append((pid, r.get("name", "")))
 
             if candidates:
-                # Evaluate candidates in parallel
+                emit(f"[info] Checking {len(candidates)} candidates (parallel)… found so far: {len(found)}/{requested}")
+                from concurrent.futures import ThreadPoolExecutor, as_completed
                 with ThreadPoolExecutor(max_workers=8) as ex:
                     futs = [ex.submit(eval_place, pid, nm) for pid, nm in candidates]
                     for fut in as_completed(futs):
-                        row = fut.result()
+                        try:
+                            row = fut.result()
+                        except Exception as e:
+                            emit(f"[warn] worker error: {e}")
+                            continue
                         if row:
                             found.append(row)
                             if len(found) >= requested:
@@ -276,13 +295,15 @@ def _generate_for_user(
             if not token or len(found) >= requested:
                 break
 
-            # Per Google Places docs, next_page_token takes ~2s to become valid
+            # Google requires ~2s before next_page_token is valid
             time.sleep(2.0)
 
         if len(found) >= requested:
             break
 
+    emit(f"[info] Completed. Found {len(found)} new parks.")
     return found
+
 
 # -----------------------------------------------------------------------------
 # Demo-limit modal/dialog
