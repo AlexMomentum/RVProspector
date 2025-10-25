@@ -452,6 +452,64 @@ def main():
         st.stop()
 
     st.divider()
+        # -------------------------------------------------------------------------
+    # 📜 History (view & CSV export)
+    # -------------------------------------------------------------------------
+    st.divider()
+    with st.expander("📜 View My Search History", expanded=False):
+        user_key = str(st.session_state.get("user_key", "")) or ""
+        if not user_key:
+            st.info("Sign in or continue as guest to build your history.")
+        else:
+            try:
+                rows = db.list_history_rows(sb, user_key, limit=1000)
+            except Exception as e:
+                st.error(f"Could not load history: {e}")
+                rows = []
+
+            if not rows:
+                st.caption("No history yet for this account.")
+            else:
+                # Show a tidy table
+                df_hist = pd.DataFrame(rows)
+
+                # Optional: reorder/rename for readability
+                nice_cols = [
+                    "created_at", "park_name", "phone", "website",
+                    "address", "city", "state", "zip",
+                    "pad_count", "source"
+                ]
+                existing = [c for c in nice_cols if c in df_hist.columns]
+                df_view = df_hist[existing].copy()
+
+                # Human-friendly created_at (keep original values for CSV)
+                if "created_at" in df_view.columns:
+                    try:
+                        df_view["created_at"] = pd.to_datetime(df_view["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
+                    except Exception:
+                        pass
+
+                st.write(f"Total saved leads: **{len(df_hist)}**")
+                # Prefer markdown if tabulate is present, else fallback to dataframe
+                try:
+                    st.markdown(df_view.to_markdown(index=False), unsafe_allow_html=True)
+                except Exception:
+                    st.dataframe(df_view, use_container_width=True, hide_index=True)
+
+                # Full CSV download (all rows, all columns)
+                try:
+                    all_rows = db.list_history_all(sb, user_key)
+                    df_all = pd.DataFrame(all_rows)
+                    csv = df_all.to_csv(index=False)
+                    st.download_button(
+                        "⬇️ Download My Entire History (CSV)",
+                        data=csv,
+                        file_name="rvprospector_history.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+                except Exception as e:
+                    st.warning(f"CSV export unavailable: {e}")
 
     # Controls
     col1, col2 = st.columns(2)
