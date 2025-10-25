@@ -1,4 +1,3 @@
-
 # web/app.py
 from __future__ import annotations
 
@@ -317,11 +316,13 @@ def _generate_for_user(
             emit("[warn] Could not auto-detect location from IP; using manual location.")
             near_me = False
 
+    # quick early skip set (cuts work before details calls)
     OTA_HOST_SNIPPETS = (
         "booking.com", "expedia", "hotels.com", "koa.com", "goodsam.com",
         "campendium", "reserveamerica", "hipcamp", "rvshare", "roverpass",
         "recreation.gov", "usace.army.mil",
     )
+    CHAIN_NAME_SNIPS = ("koa", "good sam", "rvshare")
 
     def eval_place(pid: str, r_name_fallback: str) -> Dict[str, Any] | None:
         try:
@@ -408,7 +409,16 @@ def _generate_for_user(
                 if not pid or pid in seen or pid in already:
                     continue
                 seen.add(pid)
-                candidates.append((pid, r.get("name", "")))
+
+                # early skip: hotel-ish types and obvious chains (faster overall)
+                rtypes = r.get("types", []) or []
+                rname  = (r.get("name") or "")
+                if any(t in rtypes for t in ("lodging", "hotel", "motel", "resort")):
+                    continue
+                if any(sn in rname.lower() for sn in CHAIN_NAME_SNIPS):
+                    continue
+
+                candidates.append((pid, rname))
 
             if candidates:
                 emit(f"[info] Checking {len(candidates)} candidates (parallel)… found so far: {len(found)}/{requested}")
@@ -629,7 +639,7 @@ def main():
     st.divider()
 
     # -------------------------------------------------------------------------
-    # 📜 View My Search History (responsive + real links + centered pager only)
+    # 📜 View My Search History (responsive + real links + arrow pager)
     # -------------------------------------------------------------------------
     with st.expander("📜 View My Search History", expanded=False):
         user_key = str(st.session_state.get("user_key", "")) or ""
@@ -640,7 +650,6 @@ def main():
             page = st.session_state["__hist_page"]
             offset = (page - 1) * PAGE_SIZE_HISTORY
 
-            # Fetch PAGE_SIZE+1 to know if a next page exists
             rows_plus = []
             try:
                 rows_plus = list_history_rows(
@@ -688,21 +697,25 @@ def main():
 
                 _render_responsive_table(df_hist, order, labels)
 
-                # Bottom controls: compact centered pager ([-] Page N [+]) with correct directions
+                # ---- Arrow pager (stable; no random jumps) ----
                 st.divider()
-                left, middle, right = st.columns([1, 2, 1])
-                with middle:
-                    bcol1, bcol2, bcol3 = st.columns([1, 2, 1])
+                # compute total pages if possible
+                try:
+                    cnt_resp = sb.table("history").select("id", count="exact").ilike("email", user_key).execute()
+                    total_rows = int(getattr(cnt_resp, "count", None) or 0)
+                except Exception:
+                    total_rows = page * PAGE_SIZE_HISTORY + (1 if has_next else 0)
+                total_pages = max(1, (total_rows + PAGE_SIZE_HISTORY - 1) // PAGE_SIZE_HISTORY)
 
-                    prev_clicked = bcol1.button("−", key="hist_page_minus", use_container_width=True, disabled=(page <= 1))
-                    # read-only page label (keeps state stable across reruns)
-                    bcol2.markdown(f"<div style='text-align:center;padding:6px 0'>Page <strong>{page}</strong></div>", unsafe_allow_html=True)
-                    next_clicked = bcol3.button("+", key="hist_page_plus", use_container_width=True, disabled=(not has_next))
-
-                # Apply clicks AFTER layout so Streamlit doesn't fight the widget state
+                l, m, r = st.columns([1, 2, 1])
+                with m:
+                    c1, c2, c3 = st.columns([1, 2, 1])
+                    prev_clicked = c1.button("‹", key="hist_prev", use_container_width=True, disabled=(page <= 1))
+                    c2.markdown(f"<div style='text-align:center'>Page <b>{page}</b> / {total_pages}</div>", unsafe_allow_html=True)
+                    next_clicked = c3.button("›", key="hist_next", use_container_width=True, disabled=(page >= total_pages))
                 if prev_clicked and page > 1:
                     st.session_state["__hist_page"] = page - 1
-                if next_clicked and has_next:
+                if next_clicked and page < total_pages:
                     st.session_state["__hist_page"] = page + 1
 
                 # CSV (all history)
