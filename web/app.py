@@ -625,6 +625,9 @@ def main():
     # -------------------------------------------------------------------------
     # 📜 View My Search History (responsive + clickable + bottom pagination)
     # -------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # 📜 View My Search History (responsive + real links + centered pager only)
+    # -------------------------------------------------------------------------
     with st.expander("📜 View My Search History", expanded=False):
         user_key = str(st.session_state.get("user_key", "")) or ""
         if not user_key:
@@ -637,13 +640,15 @@ def main():
             # Fetch PAGE_SIZE+1 to know if a next page exists
             rows_plus = []
             try:
-                rows_plus = list_history_rows(get_client(), user_key, limit=PAGE_SIZE_HISTORY + 1, offset=offset)
+                rows_plus = list_history_rows(
+                    get_client(), user_key,
+                    limit=PAGE_SIZE_HISTORY + 1, offset=offset
+                )
             except Exception as e:
                 st.error(f"Could not load history: {e}")
 
             rows = rows_plus[:PAGE_SIZE_HISTORY]
             has_next = len(rows_plus) > PAGE_SIZE_HISTORY
-            has_prev = page > 1
 
             if not rows and page > 1:
                 st.info("No more results on this page. Try going back a page.")
@@ -652,12 +657,13 @@ def main():
             else:
                 df_hist = pd.DataFrame(rows)
 
-                # Clickable park names
+                # Clickable park names: make real <a> tags
                 if {"park_name", "website"}.issubset(df_hist.columns):
-                    df_hist["park_name"] = df_hist.apply(
-                        lambda x: f"[{x['park_name']}]({x['website']})" if x.get("website") else x["park_name"],
-                        axis=1,
-                    )
+                    def _anchor(r):
+                        name = (r.get("park_name") or "").replace('"', "&quot;")
+                        url  = (r.get("website") or "").replace('"', "&quot;")
+                        return f'<a href="{url}" target="_blank" rel="noopener noreferrer">{name}</a>' if url else name
+                    df_hist["park_name"] = df_hist.apply(_anchor, axis=1)
 
                 # Columns to show (no pad_count or source)
                 order = ["created_at", "park_name", "phone", "address", "city", "state", "zip"]
@@ -679,23 +685,17 @@ def main():
 
                 _render_responsive_table(df_hist, order, labels)
 
-                # Bottom controls
+                # Bottom controls: ONLY the centered page number (with - / +).
                 st.divider()
-                c1, c2, c3 = st.columns([1, 2, 1])
-                with c1:
-                    if st.button("◀ Prev", key="hist_prev_bottom", use_container_width=True, disabled=not has_prev):
-                        st.session_state["__hist_page"] = max(1, page - 1)
-                with c2:
-                    st.write("")  # spacer
+                center = st.columns([1, 2, 1])[1]
+                with center:
                     new_page = st.number_input(
                         "Page", min_value=1, step=1, value=page,
                         key="__hist_page_input_bottom", label_visibility="collapsed"
                     )
-                    if new_page != page:
+                    # allow any number; the fetch above will naturally clamp on next render
+                    if int(new_page) != page:
                         st.session_state["__hist_page"] = int(new_page)
-                with c3:
-                    if st.button("Next ▶", key="hist_next_bottom", use_container_width=True, disabled=not has_next):
-                        st.session_state["__hist_page"] = page + 1
 
                 # CSV (all history)
                 try:
