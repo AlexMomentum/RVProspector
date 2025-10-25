@@ -17,14 +17,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # -----------------------------------------------------------------------------
-# Tunables / Perf
+# Tunables / Perf (override via env without redeploy)
 # -----------------------------------------------------------------------------
-# Increase on beefier hosts (12–24 is fine on Streamlit Cloud Pro; test & tune)
-WORKERS = int(os.getenv("RVP_WORKERS", "12"))
-# Default search radius when "Use my current area" is enabled
-DEFAULT_NEAR_ME_RADIUS_M = int(os.getenv("RVP_RADIUS_M", "30000"))
+WORKERS = int(os.getenv("RVP_WORKERS", "20"))                # faster default
+DEFAULT_NEAR_ME_RADIUS_M = int(os.getenv("RVP_RADIUS_M", "25000"))
+TARGET_QUERY_LIMIT = int(os.getenv("RVP_QUERY_LIMIT", "999"))
+PAGE_SLEEP_SECS = float(os.getenv("RVP_PAGE_SLEEP", "2.2"))
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # Secrets -> env (for Streamlit Cloud)
 # -----------------------------------------------------------------------------
 def _secrets_to_env():
@@ -32,7 +32,7 @@ def _secrets_to_env():
         "GOOGLE_PLACES_API_KEY": ["GOOGLE_PLACES_API_KEY", "GOOGLE_MAPS_API_KEY", "GOOGLE_API_KEY"],
         "SUPABASE_URL": ["SUPABASE_URL"],
         "SUPABASE_ANON_KEY": ["SUPABASE_ANON_KEY"],
-        "SUPABASE_SERVICE_ROLE_KEY": ["SUPABASE_SERVICE_ROLE_KEY", "SERVICE_ROLE_KEY"],  # needed to write unlocked=True
+        "SUPABASE_SERVICE_ROLE_KEY": ["SUPABASE_SERVICE_ROLE_KEY", "SERVICE_ROLE_KEY"],
         "SIGNUP_URL": ["SIGNUP_URL"],
         "DONATE_URL": ["DONATE_URL"],
     }
@@ -47,14 +47,12 @@ def _secrets_to_env():
             if val:
                 os.environ[env_name] = str(val)
                 break
-
 _secrets_to_env()
 
-# ----------- Configurable links (must exist before sidebar uses them) ----------
 SIGNUP_URL = os.getenv("SIGNUP_URL", "").strip()
 DONATE_URL = os.getenv("DONATE_URL", "").strip()
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # Path setup so Python can find web/ and src/
 # -----------------------------------------------------------------------------
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -64,24 +62,20 @@ if str(ROOT) not in sys.path:
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-# ----------------------------------------------------------------------------- 
-# ✅ Single, robust import of web.db
+# -----------------------------------------------------------------------------
+# ✅ Import web.db (works whether web is a package or not)
 # -----------------------------------------------------------------------------
 def _import_web_db():
-    # Try normal import
     try:
         import web.db as dbmod
         return dbmod
     except Exception:
         pass
-
-    # Fallback: import from file path (if 'web' isn't a package)
     import importlib.util, types
     web_dir = ROOT / "web"
     db_path = web_dir / "db.py"
     if not db_path.exists():
         raise RuntimeError(f"Could not find web/db.py at {db_path}")
-
     spec = importlib.util.spec_from_file_location("web.db", db_path)
     dbmod = importlib.util.module_from_spec(spec)
     sys.modules.setdefault("web", types.ModuleType("web"))
@@ -97,21 +91,59 @@ except Exception as e:
     st.code("".join(traceback.format_exc()))
     st.stop()
 
-# Re-export helpers
-fetch_history_place_ids = db.fetch_history_place_ids
+# Re-export helpers present in your db.py
 get_client = db.get_client
-increment_leads = db.increment_leads
 is_unlocked = db.is_unlocked
-record_history = db.record_history
 upsert_profile = db.upsert_profile
+record_history = db.record_history
+increment_leads = db.increment_leads
 slice_by_trial = db.slice_by_trial
 record_signup = getattr(db, "record_signup", None)
 grant_unlimited = getattr(db, "grant_unlimited", None)
 
-# Import core AFTER paths are set
+# --- Fallbacks if your deployed db.py is older (no list_history_* helpers) ---
+def _fallback_list_history_rows(sb, user_key: str, limit: int = 1000) -> list[dict]:
+    return (
+        sb.table("history")
+        .select(
+            "created_at, park_place_id, park_name, phone, website, address, city, state, zip, source, detected_keyword, pad_count"
+        )
+        .eq("email", user_key)
+        .order("created_at", desc=True)
+        .limit(int(limit))
+        .execute()
+        .data
+        or []
+    )
+
+def _fallback_list_history_all(sb, user_key: str) -> list[dict]:
+    out: list[dict] = []
+    page_size, offset = 1000, 0
+    while True:
+        resp = (
+            sb.table("history")
+            .select(
+                "created_at, park_place_id, park_name, phone, website, address, city, state, zip, source, detected_keyword, pad_count"
+            )
+            .eq("email", user_key)
+            .order("created_at", desc=True)
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        rows = resp.data or []
+        out.extend(rows)
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    return out
+
+list_history_rows = getattr(db, "list_history_rows", _fallback_list_history_rows)
+list_history_all = getattr(db, "list_history_all", _fallback_list_history_all)
+
+# Import core after sys.path updates
 from rvprospector import core as c  # noqa: E402
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # Page config + Sidebar
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="RV Prospector (Web)", page_icon="🗺️", layout="centered")
@@ -123,31 +155,38 @@ if DONATE_URL:
 else:
     st.sidebar.caption("Set DONATE_URL to show a donate button.")
 
-# ----------------------------------------------------------------------------- 
-# Cookie + session helpers
+# -----------------------------------------------------------------------------
+# Cookie + session helpers (persistent + version-tolerant)
 # -----------------------------------------------------------------------------
 def _cm_set(cm: stx.CookieManager, key: str, value: str):
-    """
-    Sets a cookie with a 6-month expiry. Falls back gracefully if this version
-    of extra_streamlit_components doesn't support expires_at.
-    """
+    expires_at = datetime.utcnow() + timedelta(days=180)
     try:
-        cm.set(key, value, expires_at=(datetime.utcnow() + timedelta(days=180)))
+        cm.set(key, value, expires_at=expires_at, key=key, path="/", secure=True, samesite="Lax")
+        return
     except TypeError:
-        cm.set(key, value)
+        pass
+    try:
+        cm.set(key, value, expiry_days=180, key=key, path="/", secure=True, samesite="Lax")
+        return
+    except TypeError:
+        pass
+    cm.set(key, value)
 
 def _cm_delete(cm: stx.CookieManager, key: str):
     try:
-        cm.delete(key)
-    except Exception:
-        # Older versions may not implement delete; overwrite to expire
-        _cm_set(cm, key, "")
+        cm.delete(key, key=key, path="/")
+    except TypeError:
+        try:
+            cm.delete(key)
+        except Exception:
+            _cm_set(cm, key, "")
 
 def _ensure_guest_cookie(cm: stx.CookieManager, cookies: Dict[str, str]) -> str:
     gid = cookies.get("rvp_guest_id")
     if not gid:
         gid = str(uuid.uuid4())
         _cm_set(cm, "rvp_guest_id", gid)
+        st.rerun()
     return f"guest:{gid}"
 
 def _set_signed_in(cm: stx.CookieManager, email: str, unlocked: bool):
@@ -160,7 +199,7 @@ def _sign_out(cm: stx.CookieManager):
     st.session_state.clear()
     st.rerun()
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # Location helpers
 # -----------------------------------------------------------------------------
 US_STATES = {
@@ -174,7 +213,6 @@ US_STATES = {
     "TN": "Tennessee", "TX": "Texas", "UT": "Utah", "VT": "Vermont", "VA": "Virginia", "WA": "Washington",
     "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming", "DC": "District of Columbia"
 }
-
 def normalize_location(raw: str) -> str:
     s = (raw or "").strip()
     if not s:
@@ -185,14 +223,27 @@ def normalize_location(raw: str) -> str:
         return f"{s.title()}, USA"
     return s
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # Cached calls
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_place_details(api_key: str, pid: str) -> Dict[str, Any]:
     return c.google_place_details(api_key, pid)
 
-# ----------------------------------------------------------------------------- 
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_text_search(api_key: str, query: str, location_bias: str | None,
+                        pagetoken: str | None, latlng: tuple[float, float] | None,
+                        radius_m: int) -> dict:
+    return c.google_text_search(
+        api_key=api_key,
+        query=query,
+        location_bias=location_bias,
+        pagetoken=pagetoken,
+        latlng=latlng,
+        radius_m=radius_m,
+    )
+
+# -----------------------------------------------------------------------------
 # Search core
 # -----------------------------------------------------------------------------
 def _generate_for_user(
@@ -205,10 +256,14 @@ def _generate_for_user(
     radius_m: int | None = None,
 ) -> List[Dict[str, Any]]:
     sb = get_client()
-    already = fetch_history_place_ids(sb, email)
+    # Fetch just the ids to skip duplicates
+    try:
+        already = {row.get("park_place_id") for row in sb.table("history").select("park_place_id").eq("email", email).execute().data or []}
+    except Exception:
+        already = set()
+
     seen: set[str] = set()
     found: List[Dict[str, Any]] = []
-    checked = 0
 
     radius_m = int(radius_m or DEFAULT_NEAR_ME_RADIUS_M)
 
@@ -228,11 +283,11 @@ def _generate_for_user(
     OTA_HOST_SNIPPETS = (
         "booking.com", "expedia", "hotels.com", "koa.com", "goodsam.com",
         "campendium", "reserveamerica", "hipcamp", "rvshare", "roverpass",
+        "recreation.gov", "usace.army.mil",
     )
 
     # ---------- worker to evaluate one candidate ----------
     def eval_place(pid: str, r_name_fallback: str) -> Dict[str, Any] | None:
-        nonlocal checked
         try:
             det = _cached_place_details(api_key, pid)
             name = det.get("name", r_name_fallback)
@@ -249,13 +304,11 @@ def _generate_for_user(
                 if "postal_code" in types:
                     comps["zip"] = comp.get("long_name", "")
 
-            if not website:
+            # Micro-filters
+            if not website and not phone:
                 return None
-
-            lower_site = website.lower()
-            if any(sn in lower_site for sn in OTA_HOST_SNIPPETS):
+            if website and any(sn in website.lower() for sn in OTA_HOST_SNIPPETS):
                 return None
-
             if avoid_conglomerates and c._is_conglomerate(name, website):
                 return None
 
@@ -263,11 +316,9 @@ def _generate_for_user(
             try:
                 no_booking, booking_hit, pad_count = c.check_booking_and_pads(website, timeout_sec=7)
             except TypeError:
-                # old signature (no timeout)
                 no_booking, booking_hit, pad_count = c.check_booking_and_pads(website)
 
-            qualifies = no_booking and (pad_count is None or pad_count >= c.PAD_MIN)
-            if not qualifies:
+            if not (no_booking and (pad_count is None or pad_count >= c.PAD_MIN)):
                 return None
 
             return {
@@ -283,21 +334,23 @@ def _generate_for_user(
                 "source": "Google Places",
             }
         except Exception as e:
-            # Log but don’t kill the batch
             emit(f"[warn] skipped place {pid}: {e}")
             return None
-        finally:
-            checked += 1
 
     # ---------- main search ----------
-    for query in c.TARGET_QUERIES:
+    for idx, query in enumerate(c.TARGET_QUERIES):
+        if idx >= TARGET_QUERY_LIMIT or len(found) >= requested:
+            break
+
         where = "your current area" if near_me else location
         emit(f"[info] Searching '{query}' near {where}")
 
         token = None
         while True:
+            if len(found) >= requested:
+                break
             try:
-                data = c.google_text_search(
+                data = _cached_text_search(
                     api_key=api_key,
                     query=query,
                     location_bias=None if near_me else location,
@@ -328,11 +381,11 @@ def _generate_for_user(
                 with ThreadPoolExecutor(max_workers=WORKERS) as ex:
                     futs = [ex.submit(eval_place, pid, nm) for pid, nm in candidates]
                     for fut in as_completed(futs):
+                        row = None
                         try:
                             row = fut.result()
                         except Exception as e:
                             emit(f"[warn] worker error: {e}")
-                            continue
                         if row:
                             found.append(row)
                             if len(found) >= requested:
@@ -341,16 +394,12 @@ def _generate_for_user(
             if not token or len(found) >= requested:
                 break
 
-            # Google requires ~2s before next_page_token is valid
-            time.sleep(2.0)
-
-        if len(found) >= requested:
-            break
+            time.sleep(PAGE_SLEEP_SECS)
 
     emit(f"[info] Completed. Found {len(found)} new parks.")
     return found
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # Demo-limit modal/dialog
 # -----------------------------------------------------------------------------
 def _render_demo_limit_body(sb, cm):
@@ -405,20 +454,17 @@ def show_demo_limit(sb, cm):
             _render_demo_limit_body(sb, cm)
         _dlg()
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # App
 # -----------------------------------------------------------------------------
 def main():
     st.markdown("<h1>🗺️ RV Prospector</h1>", unsafe_allow_html=True)
     st.caption("Find RV parks without online booking — Demo gives you 10 new leads per day.")
 
-    # Exactly ONE CookieManager
     cm = stx.CookieManager(key="rvp_cookies")
-
     sb = get_client()
     st.session_state.setdefault("log", [])
 
-    # Fetch cookies ONCE per run
     cookies = cm.get_all()
     if cookies is None:
         st.stop()
@@ -432,7 +478,7 @@ def main():
                 unlocked_db = bool(is_unlocked(sb, saved_email))
             except Exception:
                 unlocked_db = False
-            _set_signed_in(cm, saved_email, prior or unlocked_db)  # don't downgrade
+            _set_signed_in(cm, saved_email, prior or unlocked_db)
         else:
             st.session_state["user_key"] = _ensure_guest_cookie(cm, cookies)
             st.session_state["unlocked"] = False
@@ -490,7 +536,7 @@ def main():
             if st.button("Sign out"):
                 _sign_out(cm)
 
-    # API key (from env/secrets)
+    # API key
     api_key = c.load_api_key()
     if not api_key:
         st.error("Server misconfigured: missing API key.")
@@ -499,35 +545,39 @@ def main():
     st.divider()
 
     # -------------------------------------------------------------------------
-    # 📜 History (view & CSV export)
+    # 📜 View My Search History + CSV (clickable park names)
     # -------------------------------------------------------------------------
     with st.expander("📜 View My Search History", expanded=False):
         user_key = str(st.session_state.get("user_key", "")) or ""
         if not user_key:
             st.info("Sign in or continue as guest to build your history.")
         else:
+            rows = []
             try:
-                rows = db.list_history_rows(sb, user_key, limit=1000)
+                rows = list_history_rows(sb, user_key, limit=1000)
             except Exception as e:
                 st.error(f"Could not load history: {e}")
-                rows = []
 
             if not rows:
                 st.caption("No history yet for this account.")
             else:
-                # Show a tidy table
                 df_hist = pd.DataFrame(rows)
 
-                # Optional: reorder/rename for readability
+                # Render clickable park names via Markdown table
+                if {"park_name", "website"}.issubset(df_hist.columns):
+                    df_hist["park_name"] = df_hist.apply(
+                        lambda x: f"[{x['park_name']}]({x['website']})" if x.get("website") else x["park_name"],
+                        axis=1,
+                    )
+
                 nice_cols = [
-                    "created_at", "park_name", "phone", "website",
+                    "created_at", "park_name", "phone",
                     "address", "city", "state", "zip",
                     "pad_count", "source"
                 ]
                 existing = [c for c in nice_cols if c in df_hist.columns]
                 df_view = df_hist[existing].copy()
 
-                # Human-friendly created_at (keep original values for CSV)
                 if "created_at" in df_view.columns:
                     try:
                         df_view["created_at"] = pd.to_datetime(df_view["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
@@ -536,13 +586,13 @@ def main():
 
                 st.write(f"Total saved leads: **{len(df_hist)}**")
                 try:
-                    st.dataframe(df_view, use_container_width=True, hide_index=True)
-                except Exception:
                     st.markdown(df_view.to_markdown(index=False), unsafe_allow_html=True)
+                except Exception:
+                    st.dataframe(df_view, use_container_width=True, hide_index=True)
 
                 # Full CSV download (all rows, all columns)
                 try:
-                    all_rows = db.list_history_all(sb, user_key)
+                    all_rows = list_history_all(sb, user_key)
                     df_all = pd.DataFrame(all_rows)
                     csv = df_all.to_csv(index=False)
                     st.download_button(
@@ -555,7 +605,9 @@ def main():
                 except Exception as e:
                     st.warning(f"CSV export unavailable: {e}")
 
+    # -------------------------------------------------------------------------
     # Controls
+    # -------------------------------------------------------------------------
     col1, col2 = st.columns(2)
     with col1:
         near_me = st.checkbox("Use my current area", value=True)
@@ -572,8 +624,6 @@ def main():
     if st.button("🚀 Find RV Parks"):
         user_key = st.session_state["user_key"]
         unlocked = bool(st.session_state.get("unlocked"))
-
-        # Demo/Unlimited slicing
         allowed, is_unlim, remaining = (requested, True, -1) if unlocked else slice_by_trial(
             sb, user_key, int(requested)
         )
@@ -602,29 +652,28 @@ def main():
             st.info("No new parks found.")
             st.stop()
 
-        # ---------------------- Clean display ----------------------
+        # ---------------------- Results (clickable names) ----------------------
         df = pd.DataFrame(rows)
-        if "park_place_id" in df.columns:
-            df = df.drop(columns=["park_place_id"])
-
-        df.insert(0, "#", range(1, len(df) + 1))
-
         if "website" in df.columns and "park_name" in df.columns:
             df["park_name"] = df.apply(
                 lambda x: f"[{x['park_name']}]({x['website']})" if x["website"] else x["park_name"],
                 axis=1,
             )
-            df = df.drop(columns=["website"])
+        show_cols = ["park_name", "phone", "address", "city", "state", "zip", "pad_count", "source"]
+        show_cols = [c for c in show_cols if c in df.columns]
+        df = df[show_cols].copy()
+        df.insert(0, "#", range(1, len(df) + 1))
 
         st.subheader(f"Results ({len(df)})")
         try:
-            st.dataframe(df, use_container_width=True, hide_index=True)
-        except Exception:
             st.markdown(df.to_markdown(index=False), unsafe_allow_html=True)
+        except Exception:
+            st.dataframe(df, use_container_width=True, hide_index=True)
 
         # CSV download
         buf = io.StringIO()
-        df.to_csv(buf, index=False)
+        df_csv = pd.DataFrame(rows).drop(columns=["park_place_id"], errors="ignore")
+        df_csv.to_csv(buf, index=False)
         st.download_button("⬇️ Download CSV", buf.getvalue(), "rv_parks.csv", "text/csv")
 
         with st.expander("Run Log"):
