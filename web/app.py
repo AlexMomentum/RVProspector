@@ -560,46 +560,28 @@ def main():
         if not user_key:
             st.info("Sign in or continue as guest to build your history.")
         else:
-            st.session_state.setdefault("__hist_page", 1)  # 1-based for humans
-
-            # Controls row
-            controls = st.columns([1, 1, 3, 4])
-            with controls[0]:
-                prev_clicked = st.button("◀ Prev", key="hist_prev", use_container_width=True,
-                                         disabled=st.session_state["__hist_page"] <= 1)
-            with controls[1]:
-                next_clicked = st.button("Next ▶", key="hist_next", use_container_width=True)
-            with controls[2]:
-                page_num = st.number_input("Page", min_value=1, step=1,
-                                           value=st.session_state["__hist_page"], key="__hist_page_input")
-            with controls[3]:
-                st.caption("Showing 20 per page")
-
-            # Apply control changes (no st.rerun()—Streamlit will re-execute anyway)
-            if prev_clicked:
-                st.session_state["__hist_page"] = max(1, st.session_state["__hist_page"] - 1)
-            if next_clicked:
-                st.session_state["__hist_page"] = st.session_state["__hist_page"] + 1
-            if page_num != st.session_state["__hist_page"]:
-                st.session_state["__hist_page"] = int(page_num)
-
+            # 1-based page index
+            st.session_state.setdefault("__hist_page", 1)
             page = st.session_state["__hist_page"]
-            offset = (page - 1) * PAGE_SIZE_HISTORY
 
-            rows = []
+            # Fetch PAGE_SIZE+1 to know if a "next" page exists without a second query
+            offset = (page - 1) * PAGE_SIZE_HISTORY
+            rows_plus = []
             try:
-                rows = list_history_rows(sb, user_key, limit=PAGE_SIZE_HISTORY, offset=offset)
+                rows_plus = list_history_rows(
+                    get_client(), user_key,
+                    limit=PAGE_SIZE_HISTORY + 1,
+                    offset=offset
+                )
             except Exception as e:
                 st.error(f"Could not load history: {e}")
 
-            # Disable "Next" button if fewer than page size returned
-            if len(rows) < PAGE_SIZE_HISTORY:
-                st.session_state["__hist_next_disabled"] = True
-            else:
-                st.session_state["__hist_next_disabled"] = False
+            rows = rows_plus[:PAGE_SIZE_HISTORY]
+            has_next = len(rows_plus) > PAGE_SIZE_HISTORY
+            has_prev = page > 1
 
             if not rows and page > 1:
-                st.info("No more results.")
+                st.info("No more results on this page. Try going back a page.")
             elif not rows:
                 st.caption("No history yet for this account.")
             else:
@@ -626,14 +608,38 @@ def main():
                     except Exception:
                         pass
 
+                # Table
                 try:
                     st.markdown(df_view.to_markdown(index=False), unsafe_allow_html=True)
                 except Exception:
                     st.dataframe(df_view, use_container_width=True, hide_index=True)
 
+                # Bottom controls
+                st.divider()
+                c1, c2, c3 = st.columns([1, 2, 1])
+                with c1:
+                    if st.button("◀ Prev", key="hist_prev_bottom", use_container_width=True, disabled=not has_prev):
+                        st.session_state["__hist_page"] = max(1, page - 1)
+                with c2:
+                    # center the page input without label noise
+                    st.write("")  # spacer
+                    new_page = st.number_input(
+                        "Page",
+                        min_value=1,
+                        step=1,
+                        value=page,
+                        key="__hist_page_input_bottom",
+                        label_visibility="collapsed"
+                    )
+                    if new_page != page:
+                        st.session_state["__hist_page"] = int(new_page)
+                with c3:
+                    if st.button("Next ▶", key="hist_next_bottom", use_container_width=True, disabled=not has_next):
+                        st.session_state["__hist_page"] = page + 1
+
                 # CSV (all history)
                 try:
-                    all_rows = list_history_all(sb, user_key)
+                    all_rows = list_history_all(get_client(), user_key)
                     df_all = pd.DataFrame(all_rows)
                     csv = df_all.to_csv(index=False)
                     st.download_button(
