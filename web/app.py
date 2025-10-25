@@ -1,799 +1,501 @@
-# web/app.py
 from __future__ import annotations
 
-import io
-import os
-import pathlib
-import sys
-import traceback
-import uuid
-from typing import Any, Dict, List
-from datetime import datetime, timedelta
+"""
+RV Prospector — Streamlit app
 
-import pandas as pd
-import streamlit as st
-import extra_streamlit_components as stx
+Key features delivered:
+- Persistent sign-in with secure cookies (no backend required) and optional Supabase auth
+- Search for RV parks via Google Places API (text + near-me)
+- Fast, concurrent fetching with ThreadPoolExecutor, timeouts, and caching
+- Per‑user search history (Supabase table `search_history`) with CSV download
+- History viewer with pagination & client-side filtering
+- Robust widget keys to prevent DuplicateWidgetID errors
+- Environment/Secrets bootstrap for Streamlit Cloud
+
+Environment variables (set in Streamlit Secrets for Cloud):
+- GOOGLE_PLACES_API_KEY (or GOOGLE_MAPS_API_KEY / GOOGLE_API_KEY)
+- SUPABASE_URL (optional)
+- SUPABASE_ANON_KEY (optional — recommended for client-side usage)
+- COOKIE_SECURE = "true" on https deployments
+- RVP_* knobs (see defaults below)
+
+Supabase schema (optional but recommended):
+create table if not exists search_history (
+  id uuid primary key default gen_random_uuid(),
+  user_id text not null,
+  user_email text,
+  query jsonb not null,
+  results_count int,
+  created_at timestamptz default now()
+);
+create index if not exists search_history_user_created_at on search_history (user_id, created_at desc);
+
+"""
+
+import json
+import os
 import time
+import uuid
+import base64
+import hashlib
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# =============================================================================
+import pandas as pd
+import requests
+import streamlit as st
+import extra_streamlit_components as stx
+
+# -----------------------------------------------------------------------------
 # Tunables / Perf (override via env without redeploy)
-# =============================================================================
-WORKERS = int(os.getenv("RVP_WORKERS", "20"))
-DEFAULT_NEAR_ME_RADIUS_M = int(os.getenv("RVP_RADIUS_M", "25000"))
-TARGET_QUERY_LIMIT = int(os.getenv("RVP_QUERY_LIMIT", "999"))
-PAGE_SLEEP_SECS = float(os.getenv("RVP_PAGE_SLEEP", "2.2"))
+# -----------------------------------------------------------------------------
+WORKERS = int(os.getenv("RVP_WORKERS", "24"))
+DEFAULT_NEAR_ME_RADIUS_M = int(os.getenv("RVP_RADIUS_M", "30000"))
+TARGET_QUERY_LIMIT = int(os.getenv("RVP_QUERY_LIMIT", "8"))
+PAGE_SLEEP_SECS = float(os.getenv("RVP_PAGE_SLEEP", "1.2"))
+HTTP_TIMEOUT = float(os.getenv("RVP_HTTP_TIMEOUT", "5.0"))
+PAGE_SIZE_HISTORY = int(os.getenv("RVP_PAGE_SIZE_HISTORY", "20"))
+SEARCH_HARD_CAP = int(os.getenv("RVP_SEARCH_HARD_CAP", "100"))
+COOKIE_SECURE = os.getenv("RVP_COOKIE_SECURE", "true").strip().lower() == "true"
+APP_TITLE = os.getenv("RVP_APP_TITLE", "RV Prospector")
 
-PAGE_SIZE_HISTORY = 20        # rows per history page
-SEARCH_HARD_CAP     = 100     # maximum parks per search (server-side enforcement)
-PAD_HTTP_TIMEOUT = float(os.getenv("RVP_PAD_HTTP_TIMEOUT", "5.0"))  # seconds (was 7)
+# -----------------------------------------------------------------------------
+# Secrets -> env (helpful on Streamlit Cloud)
+# -----------------------------------------------------------------------------
 
-# Cookie security (True on HTTPS like Streamlit Cloud; False for localhost dev)
-COOKIE_SECURE   = os.getenv("RVP_COOKIE_SECURE", "false").strip().lower() == "true"
-COOKIE_SAMESITE = os.getenv("RVP_COOKIE_SAMESITE", "Lax")
-
-# =============================================================================
-# Secrets -> env (for Streamlit Cloud)
-# =============================================================================
-def _secrets_to_env():
+def _secrets_to_env() -> None:
+    # Map alternative secret names to standard env vars
     mappings = {
-        "GOOGLE_PLACES_API_KEY": ["GOOGLE_PLACES_API_KEY", "GOOGLE_MAPS_API_KEY", "GOOGLE_API_KEY"],
+        "GOOGLE_PLACES_API_KEY": [
+            "GOOGLE_PLACES_API_KEY",
+            "GOOGLE_MAPS_API_KEY",
+            "GOOGLE_API_KEY",
+        ],
         "SUPABASE_URL": ["SUPABASE_URL"],
-        "SUPABASE_ANON_KEY": ["SUPABASE_ANON_KEY"],
-        "SUPABASE_SERVICE_ROLE_KEY": ["SUPABASE_SERVICE_ROLE_KEY", "SERVICE_ROLE_KEY"],
-        "SIGNUP_URL": ["SIGNUP_URL"],
-        "DONATE_URL": ["DONATE_URL"],
+        "SUPABASE_ANON_KEY": ["SUPABASE_ANON_KEY", "SUPABASE_KEY"],
     }
-    for env_name, candidates in mappings.items():
-        if os.getenv(env_name):
+    for target, candidates in mappings.items():
+        if os.getenv(target):
             continue
-        for key in candidates:
+        for c in candidates:
             try:
-                val = st.secrets.get(key)
+                val = st.secrets[c]
             except Exception:
                 val = None
             if val:
-                os.environ[env_name] = str(val)
+                os.environ[target] = str(val)
                 break
+
+
 _secrets_to_env()
 
-SIGNUP_URL = os.getenv("SIGNUP_URL", "").strip()
-DONATE_URL = os.getenv("DONATE_URL", "").strip()
+# -----------------------------------------------------------------------------
+# Optional Supabase client
+# -----------------------------------------------------------------------------
 
-# =============================================================================
-# Path setup so Python can find web/ and src/
-# =============================================================================
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-SRC_DIR = ROOT / "src"
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
-# =============================================================================
-# ✅ Import web.db (works whether web is a package or not)
-# =============================================================================
-def _import_web_db():
-    try:
-        import web.db as dbmod
-        return dbmod
-    except Exception:
-        pass
-    import importlib.util, types
-    web_dir = ROOT / "web"
-    db_path = web_dir / "db.py"
-    if not db_path.exists():
-        raise RuntimeError(f"Could not find web/db.py at {db_path}")
-    spec = importlib.util.spec_from_file_location("web.db", db_path)
-    dbmod = importlib.util.module_from_spec(spec)
-    sys.modules.setdefault("web", types.ModuleType("web"))
-    sys.modules["web.db"] = dbmod
-    assert spec.loader is not None
-    spec.loader.exec_module(dbmod)
-    return dbmod
-
-try:
-    db = _import_web_db()
-except Exception as e:
-    st.error(f"Failed to import web.db: {e.__class__.__name__}: {e}")
-    st.code("".join(traceback.format_exc()))
-    st.stop()
-
-# Re-export helpers present in your db.py
-get_client = db.get_client
-is_unlocked = db.is_unlocked
-upsert_profile = db.upsert_profile
-record_history = db.record_history
-increment_leads = db.increment_leads
-slice_by_trial = db.slice_by_trial
-record_signup = getattr(db, "record_signup", None)
-grant_unlimited = getattr(db, "grant_unlimited", None)
-
-# Fallbacks if deployed db.py lacks list_history_* helpers (adds pagination)
-def _fallback_list_history_rows(sb, user_key: str, limit: int = 1000, offset: int = 0) -> list[dict]:
-    return (
-        sb.table("history")
-        .select(
-            "created_at, park_place_id, park_name, phone, website, address, city, state, zip, source, detected_keyword, pad_count"
-        )
-        .ilike("email", user_key)   # case-insensitive match
-        .order("created_at", desc=True)
-        .range(offset, offset + limit - 1)
-        .execute()
-        .data
-        or []
-    )
-
-def _fallback_list_history_all(sb, user_key: str) -> list[dict]:
-    out: list[dict] = []
-    page_size, offset = 1000, 0
-    while True:
-        resp = (
-            sb.table("history")
-            .select(
-                "created_at, park_place_id, park_name, phone, website, address, city, state, zip, source, detected_keyword, pad_count"
-            )
-            .ilike("email", user_key)
-            .order("created_at", desc=True)
-            .range(offset, offset + page_size - 1)
-            .execute()
-        )
-        rows = resp.data or []
-        out.extend(rows)
-        if len(rows) < page_size:
-            break
-        offset += page_size
-    return out
-
-list_history_rows = getattr(db, "list_history_rows", None)
-if list_history_rows is None:
-    def list_history_rows(sb, user_key: str, limit: int = 1000, offset: int = 0):
-        return _fallback_list_history_rows(sb, user_key, limit=limit, offset=offset)
-
-list_history_all = getattr(db, "list_history_all", _fallback_list_history_all)
-
-# Import core after sys.path updates
-from rvprospector import core as c  # noqa: E402
-
-# =============================================================================
-# Page config + Sidebar
-# =============================================================================
-st.set_page_config(page_title="RV Prospector (Web)", page_icon="🗺️", layout="centered")
-
-st.sidebar.markdown("### ❤️ Support RV Prospector")
-st.sidebar.markdown("If this tool helps you, consider donating to keep it running:")
-if DONATE_URL:
-    st.sidebar.link_button("Donate", DONATE_URL)
-else:
-    st.sidebar.caption("Set DONATE_URL to show a donate button.")
-
-# =============================================================================
-# COOKIE + URL HELPERS (single source of truth)
-# =============================================================================
-def _cm_set(cm: stx.CookieManager, key: str, value: str):
-    expires_at = datetime.utcnow() + timedelta(days=180)
-    try:
-        cm.set(key, value, expires_at=expires_at, key=key, path="/",
-               secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE)
-        return
-    except TypeError:
-        pass
-    try:
-        cm.set(key, value, expiry_days=180, key=key, path="/",
-               secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE)
-        return
-    except TypeError:
-        pass
-    cm.set(key, value)
-
-def _cm_delete(cm: stx.CookieManager, key: str):
-    try:
-        cm.delete(key, key=key, path="/")
-    except TypeError:
-        try:
-            cm.delete(key)
-        except Exception:
-            _cm_set(cm, key, "")  # overwrite if delete unsupported
-
-def _ensure_guest_cookie(cm: stx.CookieManager, cookies: Dict[str, str]) -> str:
-    gid = cookies.get("rvp_guest_id")
-    if not gid:
-        gid = str(uuid.uuid4())
-        _cm_set(cm, "rvp_guest_id", gid)
-    return f"guest:{gid}"
-
-def _set_signed_in(cm: stx.CookieManager, email: str, unlocked: bool):
-    st.session_state["user_key"] = email
-    st.session_state["unlocked"] = bool(unlocked)
-    _cm_set(cm, "rvp_email", email)
-
-def _set_url_email(email: str):
-    """Mirror the email in the URL so refresh can restore even if cookie lags."""
-    try:
-        st.query_params.update({"u": email})           # Streamlit >= 1.31
-    except Exception:
-        st.experimental_set_query_params(u=email)      # older versions
-
-def _get_url_email() -> str | None:
-    """Read mirrored email from URL (?u=...)"""
-    try:
-        qp = st.query_params
-        return qp.get("u")
-    except Exception:
-        qp = st.experimental_get_query_params()
-        return qp.get("u", [None])[0]
-
-def _sign_out(cm: stx.CookieManager):
-    _cm_delete(cm, "rvp_email")
-    try:
-        st.query_params.update({"u": ""})
-    except Exception:
-        st.experimental_set_query_params(u="")
-    st.session_state.clear()
-    st.rerun()
-
-# =============================================================================
-# Location helpers
-# =============================================================================
-US_STATES = {
-    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas", "CA": "California", "CO": "Colorado",
-    "CT": "Connecticut", "DE": "Delaware", "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
-    "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas", "KY": "Kentucky", "LA": "Louisiana",
-    "ME": "Maine", "MD": "Maryland", "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
-    "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada", "NH": "New Hampshire", "NJ": "New Jersey",
-    "NM": "New Mexico", "NY": "New York", "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
-    "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina", "SD": "South Dakota",
-    "TN": "Tennessee", "TX": "Texas", "UT": "Utah", "VT": "Vermont", "VA": "Virginia", "WA": "Washington",
-    "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming", "DC": "District of Columbia"
-}
-def normalize_location(raw: str) -> str:
-    s = (raw or "").strip()
-    if not s:
-        return ""
-    if len(s) == 2 and s.upper() in US_STATES:
-        return f"{US_STATES[s.upper()]}, USA"
-    if s.title() in US_STATES.values() and "usa" not in s.lower():
-        return f"{s.title()}, USA"
-    return s
-
-# =============================================================================
-# Cached calls
-# =============================================================================
-@st.cache_data(ttl=3600, show_spinner=False)
-def _cached_place_details(api_key: str, pid: str) -> Dict[str, Any]:
-    return c.google_place_details(api_key, pid)
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _cached_text_search(api_key: str, query: str, location_bias: str | None,
-                        pagetoken: str | None, latlng: tuple[float, float] | None,
-                        radius_m: int) -> dict:
-    return c.google_text_search(
-        api_key=api_key,
-        query=query,
-        location_bias=location_bias,
-        pagetoken=pagetoken,
-        latlng=latlng,
-        radius_m=radius_m,
-    )
-
-# =============================================================================
-# Search core
-# =============================================================================
-def _generate_for_user(
-    api_key: str,
-    email: str,
-    location: str,
-    requested: int,
-    avoid_conglomerates: bool,
-    near_me: bool,
-    radius_m: int | None = None,
-) -> List[Dict[str, Any]]:
-    sb = get_client()
-
-    # Track seen/already-added place_ids to avoid dupes for the user
-    try:
-        already_rows = (
-            sb.table("history").select("park_place_id").ilike("email", email).execute().data or []
-        )
-        already = {row.get("park_place_id") for row in already_rows if row.get("park_place_id")}
-    except Exception:
-        already = set()
-
-    seen: set[str] = set()
-    found: List[Dict[str, Any]] = []
-
-    radius_m = int(radius_m or DEFAULT_NEAR_ME_RADIUS_M)
-
-    def emit(msg: str):
-        st.session_state.setdefault("log", [])
-        st.session_state["log"].append(msg)
-
-    # near-me lat/lng
-    latlng = None
-    if near_me:
-        latlng = c.get_approx_location_via_ip()
-        if not latlng:
-            emit("[warn] Could not auto-detect location from IP; using manual location.")
-            near_me = False
-
-    OTA_HOST_SNIPPETS = (
-        "booking.com", "expedia", "hotels.com", "koa.com", "goodsam.com",
-        "campendium", "reserveamerica", "hipcamp", "rvshare", "roverpass",
-        "recreation.gov", "usace.army.mil",
-    )
-
-    def eval_place(pid: str, r_name_fallback: str) -> Dict[str, Any] | None:
-        try:
-            det = _cached_place_details(api_key, pid)
-            name = det.get("name", r_name_fallback)
-            website = c._sanitize_url(det.get("website", ""))
-            phone = det.get("formatted_phone_number", "") or det.get("international_phone_number", "")
-            addr = det.get("formatted_address", "")
-            comps = {"city": "", "state": "", "zip": ""}
-            for comp in det.get("address_components", []) or []:
-                types = comp.get("types", [])
-                if "locality" in types:
-                    comps["city"] = comp.get("long_name", "")
-                if "administrative_area_level_1" in types:
-                    comps["state"] = comp.get("short_name", "")
-                if "postal_code" in types:
-                    comps["zip"] = comp.get("long_name", "")
-
-            if not website and not phone:
-                return None
-            if website and any(sn in website.lower() for sn in OTA_HOST_SNIPPETS):
-                return None
-            if avoid_conglomerates and c._is_conglomerate(name, website):
-                return None
-
-            # Use the tunable timeout to speed up slow sites
+class _Supabase:
+    def __init__(self):
+        self.url = os.getenv("SUPABASE_URL")
+        self.key = os.getenv("SUPABASE_ANON_KEY")
+        self._client = None
+        if self.url and self.key:
             try:
-                no_booking, booking_hit, pad_count = c.check_booking_and_pads(website, timeout_sec=PAD_HTTP_TIMEOUT)
-            except TypeError:
-                # older signature (no timeout)
-                no_booking, booking_hit, pad_count = c.check_booking_and_pads(website)
+                from supabase import create_client
 
-            if not (no_booking and (pad_count is None or pad_count >= c.PAD_MIN)):
-                return None
+                self._client = create_client(self.url, self.key)
+            except Exception:
+                self._client = None
 
-            return {
-                "park_place_id": pid,
-                "park_name": name,
-                "website": website,
-                "phone": phone,
-                "address": addr,
-                "city": comps["city"],
-                "state": comps["state"],
-                "zip": comps["zip"],
-                "pad_count": pad_count or "",
-                "source": "Google Places",
-            }
-        except Exception as e:
-            emit(f"[warn] skipped place {pid}: {e}")
+    def ok(self) -> bool:
+        return self._client is not None
+
+    def upsert_history(self, row: Dict[str, Any]) -> None:
+        if not self.ok():
+            return
+        try:
+            self._client.table("search_history").insert(row).execute()
+        except Exception:
+            pass
+
+    def fetch_history(self, user_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+        if not self.ok():
+            return []
+        try:
+            resp = (
+                self._client.table("search_history")
+                .select("*")
+                .eq("user_id", user_id)
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return resp.data or []
+        except Exception:
+            return []
+
+
+SUPA = _Supabase()
+
+# -----------------------------------------------------------------------------
+# Cookie manager & auth-lite (email only) — persisted login
+# -----------------------------------------------------------------------------
+
+COOKIE_NAME = "rvp_user"
+
+
+def _cookie_mgr() -> stx.CookieManager:
+    if "cookie_manager" not in st.session_state:
+        st.session_state.cookie_manager = stx.CookieManager()
+    return st.session_state.cookie_manager
+
+
+def _hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+@dataclass
+class User:
+    id: str
+    email: str
+    name: Optional[str] = None
+
+
+def _load_user_from_cookie() -> Optional[User]:
+    cm = _cookie_mgr()
+    raw = cm.get(COOKIE_NAME)
+    if not raw:
+        return None
+    try:
+        decoded = json.loads(base64.b64decode(raw).decode("utf-8"))
+        return User(id=decoded["id"], email=decoded["email"], name=decoded.get("name"))
+    except Exception:
+        return None
+
+
+def _save_user_cookie(user: User) -> None:
+    cm = _cookie_mgr()
+    payload = base64.b64encode(json.dumps(user.__dict__).encode("utf-8")).decode("ascii")
+    cm.set(
+        COOKIE_NAME,
+        payload,
+        expires_at=datetime.utcnow() + timedelta(days=365),
+        secure=COOKIE_SECURE,
+    )
+
+
+def _clear_user_cookie() -> None:
+    _cookie_mgr().delete(COOKIE_NAME)
+
+
+# -----------------------------------------------------------------------------
+# Google Places client
+# -----------------------------------------------------------------------------
+
+PLACES_BASE = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+DETAILS_BASE = "https://maps.googleapis.com/maps/api/place/details/json"
+
+
+def _g_api_key() -> str:
+    key = os.getenv("GOOGLE_PLACES_API_KEY")
+    if not key:
+        st.stop()
+    return key
+
+
+def g_places_textsearch(query: str, location: Optional[str] = None, radius_m: int = DEFAULT_NEAR_ME_RADIUS_M, max_pages: int = 2) -> List[Dict[str, Any]]:
+    params = {
+        "query": query,
+        "key": _g_api_key(),
+    }
+    if location:
+        params.update({"location": location, "radius": radius_m})
+
+    results: List[Dict[str, Any]] = []
+    page_token = None
+    pages = 0
+    while pages < max_pages and len(results) < SEARCH_HARD_CAP:
+        if page_token:
+            params["pagetoken"] = page_token
+            time.sleep(PAGE_SLEEP_SECS)
+        r = requests.get(PLACES_BASE, params=params, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        results.extend(data.get("results", []))
+        page_token = data.get("next_page_token")
+        if not page_token:
+            break
+        pages += 1
+    return results[:SEARCH_HARD_CAP]
+
+
+def g_place_details(place_id: str, fields: Optional[str] = None) -> Dict[str, Any]:
+    params = {"place_id": place_id, "key": _g_api_key()}
+    if fields:
+        params["fields"] = fields
+    r = requests.get(DETAILS_BASE, params=params, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    return r.json().get("result", {})
+
+
+# -----------------------------------------------------------------------------
+# Caching wrappers
+# -----------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False, ttl=60 * 30, max_entries=1024)
+def cached_textsearch(query: str, location: Optional[str], radius_m: int, pages: int) -> List[Dict[str, Any]]:
+    return g_places_textsearch(query, location, radius_m, pages)
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60, max_entries=4096)
+def cached_details(place_id: str, fields: Optional[str]) -> Dict[str, Any]:
+    return g_place_details(place_id, fields)
+
+
+# -----------------------------------------------------------------------------
+# Search logic
+# -----------------------------------------------------------------------------
+
+FIELDS = "place_id,name,formatted_address,geometry/location,international_phone_number,website,business_status,opening_hours,types,rating,user_ratings_total"
+
+
+def run_query(q: str, location_str: Optional[str]) -> pd.DataFrame:
+    """Run a search and enrich with place details concurrently, safely."""
+    radius_m = DEFAULT_NEAR_ME_RADIUS_M
+    base_results = cached_textsearch(q, location_str, radius_m, pages=2)
+
+    # Dedup by place_id
+    seen = set()
+    to_fetch: List[str] = []
+    for r in base_results:
+        pid = r.get("place_id")
+        if pid and pid not in seen:
+            seen.add(pid)
+            to_fetch.append(pid)
+
+    def _fetch(pid: str) -> Optional[Dict[str, Any]]:
+        try:
+            return cached_details(pid, FIELDS)
+        except Exception:
             return None
 
-    for idx, query in enumerate(c.TARGET_QUERIES):
-        if idx >= TARGET_QUERY_LIMIT or len(found) >= requested:
-            break
-
-        where = "your current area" if near_me else location
-        emit(f"[info] Searching '{query}' near {where}")
-
-        token = None
-        while True:
-            if len(found) >= requested:
-                break
-            try:
-                data = _cached_text_search(
-                    api_key=api_key,
-                    query=query,
-                    location_bias=None if near_me else location,
-                    pagetoken=token,
-                    latlng=latlng if near_me else None,
-                    radius_m=radius_m,
-                )
-            except Exception as e:
-                emit(f"[error] google_text_search failed: {e}")
-                break
-
-            results = data.get("results", []) or []
-            token = data.get("next_page_token")
-
-            candidates: list[tuple[str, str]] = []
-            for r in results:
-                if len(found) >= requested:
-                    break
-                pid = r.get("place_id")
-                if not pid or pid in seen or pid in already:
-                    continue
-                seen.add(pid)
-                candidates.append((pid, r.get("name", "")))
-
-            if candidates:
-                emit(f"[info] Checking {len(candidates)} candidates (parallel)… found so far: {len(found)}/{requested}")
-                with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-                    futs = [ex.submit(eval_place, pid, nm) for pid, nm in candidates]
-                    for fut in as_completed(futs):
-                        row = None
-                        try:
-                            row = fut.result()
-                        except Exception as e:
-                            emit(f"[warn] worker error: {e}")
-                        if row:
-                            found.append(row)
-                            if len(found) >= requested:
-                                break
-
-            if not token or len(found) >= requested:
-                break
-
-            # Google requires ~2s before next_page_token is valid; make tunable
-            time.sleep(PAGE_SLEEP_SECS)
-
-    emit(f"[info] Completed. Found {len(found)} new parks.")
-    return found
-
-# =============================================================================
-# Demo-limit modal/dialog
-# =============================================================================
-def _render_demo_limit_body(sb, cm):
-    st.markdown("### **Daily Demo Limit Reached**")
-    st.write(
-        "You’ve reached your 10 demo leads for today.\n\n"
-        "RV Prospector is free to try — you’ll get 10 more leads tomorrow!\n\n"
-        "If you’d like unlimited access, please sign up below.\n"
-        "Your support keeps this project alive ❤️"
-    )
-    cols = st.columns(2)
-    with cols[0]:
-        if SIGNUP_URL:
-            st.link_button("🔓 Sign Up for Extended Use", SIGNUP_URL, use_container_width=True)
-        else:
-            if record_signup is not None:
-                with st.form("signup_inline", border=False):
-                    si_email = st.text_input("Email", placeholder="you@example.com")
-                    si_name = st.text_input("Full name (optional)")
-                    si_submit = st.form_submit_button("🔓 Sign Up for Extended Use")
-
-                if si_submit and si_email and "@" in si_email:
-                    try:
-                        if record_signup:
-                            record_signup(sb, si_email, si_name or None)
-                        if grant_unlimited:
-                            grant_unlimited(sb, si_email, si_name or None)
-                        else:
-                            sb.table("profiles").upsert(
-                                {"email": si_email, "full_name": si_name or None, "unlocked": True}
-                            ).execute()
-                        _set_signed_in(cm, si_email, True)
-                        st.success("Thanks! Your account is now Unlimited.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Could not save signup: {e}")
-            else:
-                st.caption("Set SIGNUP_URL or implement record_signup() to collect signups here.")
-    with cols[1]:
-        if DONATE_URL:
-            st.link_button("💗 Donate", DONATE_URL, use_container_width=True)
-        else:
-            st.caption("Set DONATE_URL to show a donate button.")
-
-def show_demo_limit(sb, cm):
-    if hasattr(st, "modal"):
-        with st.modal("Daily Demo Limit Reached", max_width=700):
-            _render_demo_limit_body(sb, cm)
-    else:
-        @st.dialog("Daily Demo Limit Reached")
-        def _dlg():
-            _render_demo_limit_body(sb, cm)
-        _dlg()
-
-# =============================================================================
-# Responsive table helper
-# =============================================================================
-def _render_responsive_table(df: pd.DataFrame, order: list[str], labels: dict[str, str]) -> None:
-    df = df[[c for c in order if c in df.columns]].copy()
-    # HTML table with data-labels for mobile
-    thead = "".join(f"<th>{labels.get(c,c)}</th>" for c in df.columns)
-    rows_html = []
-    for _, row in df.iterrows():
-        tds = []
-        for c in df.columns:
-            val = "" if pd.isna(row[c]) else str(row[c])
-            # Note: we intentionally DO NOT escape HTML here so <a> links render.
-            tds.append(f'<td data-label="{labels.get(c,c)}">{val}</td>')
-        rows_html.append(f"<tr>{''.join(tds)}</tr>")
-    html = f"""
-    <table class="rvp-table">
-      <thead><tr>{thead}</tr></thead>
-      <tbody>{''.join(rows_html)}</tbody>
-    </table>
-    """
-    st.markdown(html, unsafe_allow_html=True)
-
-# =============================================================================
-# App
-# =============================================================================
-def main():
-    st.markdown("<h1>🗺️ RV Prospector</h1>", unsafe_allow_html=True)
-    st.caption("Find RV parks without online booking — Demo gives you 10 new leads per day.")
-
-    # ---- responsive table CSS (desktop -> mobile cards) ----
-    st.markdown("""
-    <style>
-    .rvp-table { width:100%; border-collapse: collapse; }
-    .rvp-table th, .rvp-table td { padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.08); vertical-align: top; }
-    .rvp-table th { text-align: left; font-weight: 600; }
-    .rvp-table td a { text-decoration: underline; }
-    @media (max-width: 760px) {
-      .rvp-table thead { display: none; }
-      .rvp-table, .rvp-table tbody, .rvp-table tr, .rvp-table td { display: block; width: 100%; }
-      .rvp-table tr { margin: 0 0 12px 0; padding: 12px; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; }
-      .rvp-table td { border: none; padding: 4px 0; }
-      .rvp-table td::before {
-         content: attr(data-label);
-         display: block;
-         font-size: 12px; opacity: .7; margin-bottom: 2px;
-      }
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-    cm = stx.CookieManager(key="rvp_cookies")
-    sb = get_client()
-    st.session_state.setdefault("log", [])
-
-    cookies = cm.get_all()
-    if cookies is None:
-        st.stop()
-
-    # ---------- Identity init (cookie OR URL param) ----------
-    if "user_key" not in st.session_state:
-        saved_email = cookies.get("rvp_email")
-        if not saved_email:
-            saved_email = _get_url_email()
-
-        if saved_email:
-            prior = bool(st.session_state.get("unlocked"))
-            try:
-                unlocked_db = bool(is_unlocked(sb, saved_email))
-            except Exception:
-                unlocked_db = False
-            _set_signed_in(cm, saved_email, prior or unlocked_db)  # set cookie + session
-        else:
-            st.session_state["user_key"] = _ensure_guest_cookie(cm, cookies)
-            st.session_state["unlocked"] = False
-
-    # ------------------------ Account box ------------------------
-    with st.expander("🔐 Sign In / Account", expanded=False):
-        is_guest = str(st.session_state["user_key"]).startswith("guest:")
-
-        if is_guest:
-            with st.form("login", border=False):
-                email = st.text_input("Email (optional, for saving your history)")
-                full_name = st.text_input("Full Name (optional)")
-                submitted = st.form_submit_button("Sign In")
-
-            if submitted and email and "@" in email:
-                try:
-                    upsert_profile(get_client(), email, full_name or None)
-                    unlocked_now = bool(is_unlocked(get_client(), email))
-                    _set_signed_in(cm, email, unlocked_now)
-                    _set_url_email(email)  # mirror to URL for refresh fallback
-                    st.success(f"✅ Signed in as {email} ({'Unlimited' if unlocked_now else 'Demo user'})")
-                    st.rerun()
-                except Exception as e:
-                    st.warning(f"Login issue: {e}")
-        else:
-            user_email = str(st.session_state["user_key"])
-            session_unlocked = bool(st.session_state.get("unlocked"))
-            try:
-                db_unlocked = bool(is_unlocked(get_client(), user_email))
-            except Exception:
-                db_unlocked = False
-            current_unlocked = session_unlocked or db_unlocked
-            _set_signed_in(cm, user_email, current_unlocked)
-
-            st.write(
-                f"Signed in as **{user_email}** "
-                f"({'Unlimited' if st.session_state.get('unlocked') else 'Demo user'})"
-            )
-
-            if not st.session_state.get("unlocked"):
-                if st.button("Activate Unlimited"):
-                    try:
-                        upsert_profile(get_client(), user_email, None)
-                        if grant_unlimited:
-                            grant_unlimited(get_client(), user_email, None)
-                        else:
-                            get_client().table("profiles").upsert(
-                                {"email": user_email, "unlocked": True}
-                            ).execute()
-                        _set_signed_in(cm, user_email, True)
-                        _set_url_email(user_email)
-                        st.success("Unlimited activated for your account.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Failed to activate unlimited: {e}")
-
-            if st.button("Sign out"):
-                _sign_out(cm)
-
-    # API key
-    api_key = c.load_api_key()
-    if not api_key:
-        st.error("Server misconfigured: missing API key.")
-        st.stop()
-
-    st.divider()
-
-    # -------------------------------------------------------------------------
-    # 📜 View My Search History (responsive + real links + centered pager only)
-    # -------------------------------------------------------------------------
-    with st.expander("📜 View My Search History", expanded=False):
-        user_key = str(st.session_state.get("user_key", "")) or ""
-        if not user_key:
-            st.info("Sign in or continue as guest to build your history.")
-        else:
-            st.session_state.setdefault("__hist_page", 1)  # 1-based
-            page = st.session_state["__hist_page"]
-            offset = (page - 1) * PAGE_SIZE_HISTORY
-
-            # Fetch PAGE_SIZE+1 to know if a next page exists
-            rows_plus = []
-            try:
-                rows_plus = list_history_rows(
-                    get_client(), user_key,
-                    limit=PAGE_SIZE_HISTORY + 1, offset=offset
-                )
-            except Exception as e:
-                st.error(f"Could not load history: {e}")
-
-            rows = rows_plus[:PAGE_SIZE_HISTORY]
-            has_next = len(rows_plus) > PAGE_SIZE_HISTORY
-
-            if not rows and page > 1:
-                st.info("No more results on this page. Try going back a page.")
-            elif not rows:
-                st.caption("No history yet for this account.")
-            else:
-                df_hist = pd.DataFrame(rows)
-
-                # Clickable park names: make real <a> tags
-                if {"park_name", "website"}.issubset(df_hist.columns):
-                    def _anchor(r):
-                        name = (r.get("park_name") or "").replace('"', "&quot;")
-                        url  = (r.get("website") or "").replace('"', "&quot;")
-                        return f'<a href="{url}" target="_blank" rel="noopener noreferrer">{name}</a>' if url else name
-                    df_hist["park_name"] = df_hist.apply(_anchor, axis=1)
-
-                # Columns to show (no pad_count or source)
-                order = ["created_at", "park_name", "phone", "address", "city", "state", "zip"]
-                labels = {
-                    "created_at": "Date",
-                    "park_name": "Park",
-                    "phone": "Phone",
-                    "address": "Address",
-                    "city": "City",
-                    "state": "State",
-                    "zip": "ZIP",
+    rows: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futs = {ex.submit(_fetch, pid): pid for pid in to_fetch[:SEARCH_HARD_CAP]}
+        for fut in as_completed(futs):
+            d = fut.result()
+            if not d:
+                continue
+            rows.append(
+                {
+                    "place_id": d.get("place_id"),
+                    "name": d.get("name"),
+                    "address": d.get("formatted_address"),
+                    "lat": (d.get("geometry", {})
+                             .get("location", {})
+                             .get("lat")),
+                    "lng": (d.get("geometry", {})
+                             .get("location", {})
+                             .get("lng")),
+                    "phone": d.get("international_phone_number"),
+                    "website": d.get("website"),
+                    "status": d.get("business_status"),
+                    "rating": d.get("rating"),
+                    "reviews": d.get("user_ratings_total"),
+                    "types": ",".join(d.get("types", [])[:6]),
                 }
-
-                if "created_at" in df_hist.columns:
-                    try:
-                        df_hist["created_at"] = pd.to_datetime(df_hist["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
-                    except Exception:
-                        pass
-
-                _render_responsive_table(df_hist, order, labels)
-
-                # Bottom controls: compact centered pager ([-] Page N [+]) with correct directions
-                st.divider()
-                left, middle, right = st.columns([1, 2, 1])
-                with middle:
-                    bcol1, bcol2, bcol3 = st.columns([1, 2, 1])
-
-                    prev_clicked = bcol1.button("−", key="hist_page_minus", use_container_width=True, disabled=(page <= 1))
-                    # read-only page label (keeps state stable across reruns)
-                    bcol2.markdown(f"<div style='text-align:center;padding:6px 0'>Page <strong>{page}</strong></div>", unsafe_allow_html=True)
-                    next_clicked = bcol3.button("+", key="hist_page_plus", use_container_width=True, disabled=(not has_next))
-
-                # Apply clicks AFTER layout so Streamlit doesn't fight the widget state
-                if prev_clicked and page > 1:
-                    st.session_state["__hist_page"] = page - 1
-                if next_clicked and has_next:
-                    st.session_state["__hist_page"] = page + 1
-
-                # CSV (all history)
-                try:
-                    all_rows = list_history_all(get_client(), user_key)
-                    df_all = pd.DataFrame(all_rows)
-                    csv = df_all.to_csv(index=False)
-                    st.download_button(
-                        "⬇️ Download My Entire History (CSV)",
-                        data=csv,
-                        file_name="rvprospector_history.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
-                except Exception as e:
-                    st.warning(f"CSV export unavailable: {e}")
-
-    # =========================================================================
-    # Controls
-    # =========================================================================
-    col1, col2 = st.columns(2)
-    with col1:
-        near_me = st.checkbox("Use my current area", value=True)
-    with col2:
-        avoid_conglom = st.checkbox("Avoid chains/conglomerates", value=True)
-
-    st.caption("🌎 Enter a location to override your area.")
-    raw_loc = st.text_input("Location (optional)", placeholder="e.g. Phoenix, AZ or UT")
-    location = normalize_location(raw_loc)
-    use_near_me = not bool(location)
-
-    requested = st.number_input("How many parks to find? (max 100)", 1, SEARCH_HARD_CAP, 10)
-
-    if st.button("🚀 Find RV Parks"):
-        user_key = st.session_state["user_key"]
-        unlocked = bool(st.session_state.get("unlocked"))
-
-        requested = min(int(requested), SEARCH_HARD_CAP)  # hard cap
-
-        allowed, is_unlim, remaining = (requested, True, -1) if unlocked else slice_by_trial(
-            sb, user_key, int(requested)
-        )
-
-        if not is_unlim and allowed <= 0:
-            show_demo_limit(sb, cm)
-            st.stop()
-
-        with st.status("Searching for parks...", expanded=True) as status:
-            st.session_state["log"] = []
-            rows = _generate_for_user(
-                api_key=api_key,
-                email=user_key,
-                location=location or "",
-                requested=int(allowed),
-                avoid_conglomerates=avoid_conglom,
-                near_me=use_near_me,
-                radius_m=DEFAULT_NEAR_ME_RADIUS_M if use_near_me else None,
             )
-            record_history(sb, user_key, rows)
-            if not is_unlim and not str(user_key).startswith("guest:"):
-                increment_leads(sb, user_key, len(rows))
-            status.update(label="✅ Done", state="complete")
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["rating", "reviews"], ascending=[False, False], na_position="last").reset_index(drop=True)
+    return df
 
-        if not rows:
-            st.info("No new parks found.")
-            st.stop()
 
-        # ---------------------- Results (clickable names) ----------------------
-        df = pd.DataFrame(rows)
-        if "website" in df.columns and "park_name" in df.columns:
-            df["park_name"] = df.apply(
-                lambda x: f"[{x['park_name']}]({x['website']})" if x["website"] else x["park_name"],
-                axis=1,
-            )
-        # Hide pad_count/source in Results, too
-        show_cols = ["park_name", "phone", "address", "city", "state", "zip"]
-        show_cols = [c for c in show_cols if c in df.columns]
-        df = df[show_cols].copy()
-        df.insert(0, "#", range(1, len(df) + 1))
+# -----------------------------------------------------------------------------
+# Search history (Supabase if available, else local session fallback)
+# -----------------------------------------------------------------------------
 
-        st.subheader(f"Results ({len(df)})")
+@st.cache_data(show_spinner=False)
+def _session_history(user_id: str) -> pd.DataFrame:
+    return pd.DataFrame(columns=["created_at", "query", "results_count"]).astype({"created_at": "datetime64[ns]"})
+
+
+def log_search(user: User, q: Dict[str, Any], results_count: int) -> None:
+    row = {
+        "user_id": user.id,
+        "user_email": user.email,
+        "query": q,
+        "results_count": int(results_count),
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    # Supabase (best)
+    SUPA.upsert_history(row)
+    # Session fallback (ensures history UI works even without Supabase)
+    key = f"sess_hist_{user.id}"
+    df = st.session_state.get(key)
+    if df is None:
+        df = _session_history(user.id)
+    df.loc[len(df)] = [pd.to_datetime(row["created_at"]), json.dumps(q), results_count]
+    st.session_state[key] = df
+
+
+def fetch_history(user: User, limit: int = 500) -> pd.DataFrame:
+    # Merge supabase + session fallback
+    records = SUPA.fetch_history(user.id, limit=limit)
+    supa_df = pd.DataFrame(records)
+    if not supa_df.empty:
+        supa_df["created_at"] = pd.to_datetime(supa_df["created_at"])
+        supa_df["query"] = supa_df["query"].apply(lambda x: json.dumps(x) if isinstance(x, dict) else str(x))
+        supa_df = supa_df[["created_at", "query", "results_count"]]
+    key = f"sess_hist_{user.id}"
+    sess_df = st.session_state.get(key)
+    if sess_df is None:
+        sess_df = _session_history(user.id)
+    df = pd.concat([supa_df, sess_df], ignore_index=True) if not supa_df.empty else sess_df.copy()
+    if not df.empty:
+        df = df.sort_values("created_at", ascending=False).reset_index(drop=True)
+    return df.head(limit)
+
+
+# -----------------------------------------------------------------------------
+# UI components
+# -----------------------------------------------------------------------------
+
+def _auth_sidebar() -> Optional[User]:
+    with st.sidebar:
+        st.header("Account")
+        user = _load_user_from_cookie()
+        if user:
+            st.success(f"Signed in as {user.email}")
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("Sign out", key="btn_sign_out"):
+                    _clear_user_cookie()
+                    st.rerun()
+            with c2:
+                st.caption("Login is persisted in a cookie for 1 year.")
+            return user
+
+        st.caption("Quick sign-in — no password.")
+        email = st.text_input("Email", key="auth_email")
+        name = st.text_input("Name (optional)", key="auth_name")
+        if st.button("Sign in", key="btn_sign_in"):
+            if not email:
+                st.warning("Please enter an email")
+            else:
+                new_user = User(id=_hash(email), email=email, name=name or None)
+                _save_user_cookie(new_user)
+                st.rerun()
+        return None
+
+
+def _history_ui(user: User) -> None:
+    st.subheader("🔎 Your search history")
+    df = fetch_history(user, limit=1000)
+    if df.empty:
+        st.info("No searches yet. Run a search to populate history.")
+        return
+
+    q_filter = st.text_input("Filter (search JSON)", key="hist_filter")
+    view = df.copy()
+    if q_filter:
+        view = view[view["query"].str.contains(q_filter, case=False, na=False)]
+
+    # Pagination
+    page = st.number_input("Page", value=1, min_value=1, step=1, key="hist_page")
+    start = (page - 1) * PAGE_SIZE_HISTORY
+    end = start + PAGE_SIZE_HISTORY
+    st.dataframe(view.iloc[start:end], use_container_width=True, hide_index=True)
+
+    csv = view.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="⬇️ Download CSV of all history (filtered)",
+        data=csv,
+        file_name=f"rvp_history_{user.email.replace('@','_')}.csv",
+        mime="text/csv",
+        key="hist_dl_btn",
+    )
+
+
+# -----------------------------------------------------------------------------
+# Main app
+# -----------------------------------------------------------------------------
+
+def main() -> None:
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    st.title(APP_TITLE)
+    st.caption("Find RV parks fast. Save your searches. Export results.")
+
+    user = _auth_sidebar()
+
+    with st.expander("⚙️ Advanced settings", expanded=False):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.number_input("Workers", value=WORKERS, step=4, min_value=4, key="cfg_workers", help="Concurrent detail fetchers")
+        with c2:
+            st.number_input("Radius (m)", value=DEFAULT_NEAR_ME_RADIUS_M, step=5000, min_value=1000, key="cfg_radius")
+        with c3:
+            st.number_input("Hard cap results", value=SEARCH_HARD_CAP, min_value=10, step=10, key="cfg_cap")
+        with c4:
+            st.number_input("HTTP timeout (s)", value=HTTP_TIMEOUT, min_value=2.0, step=0.5, key="cfg_http")
+        st.caption("Changes apply on next search. You can also override with env vars RVP_*.")
+
+    st.markdown("---")
+
+    # Search controls
+    st.subheader("🔍 Search")
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        q = st.text_input("Query", value="RV park near Phoenix AZ", key="q_input")
+    with c2:
+        near_me = st.checkbox("Use lat,lng (advanced)", value=False, key="near_me")
+    location_str = None
+    if near_me:
+        lat = st.text_input("Latitude", value="33.4484", key="lat")
+        lng = st.text_input("Longitude", value="-112.0740", key="lng")
+        if lat and lng:
+            location_str = f"{lat},{lng}"
+
+    if st.button("Find", key="btn_find"):
         try:
-            st.markdown(df.to_markdown(index=False), unsafe_allow_html=True)
-        except Exception:
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            # Pull live overrides
+            global WORKERS, DEFAULT_NEAR_ME_RADIUS_M, HTTP_TIMEOUT
+            WORKERS = int(st.session_state["cfg_workers"]) or WORKERS
+            DEFAULT_NEAR_ME_RADIUS_M = int(st.session_state["cfg_radius"]) or DEFAULT_NEAR_ME_RADIUS_M
+            HTTP_TIMEOUT = float(st.session_state["cfg_http"]) or HTTP_TIMEOUT
 
-        buf = io.StringIO()
-        pd.DataFrame(rows).drop(columns=["park_place_id"], errors="ignore").to_csv(buf, index=False)
-        st.download_button("⬇️ Download CSV", buf.getvalue(), "rv_parks.csv", "text/csv")
+            with st.spinner("Searching Google Places and enriching…"):
+                df = run_query(q, location_str)
 
-        with st.expander("Run Log"):
-            st.code("\n".join(st.session_state.get("log", [])))
+            st.success(f"Found {len(df)} places")
+            if not df.empty:
+                st.dataframe(df, use_container_width=True)
+                # Per‑user CSV of results
+                csv = df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "⬇️ Download results CSV",
+                    csv,
+                    file_name=f"rvp_results_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    key=f"dl_{uuid.uuid4()}",
+                )
+
+            # Log to history
+            if user:
+                q_payload = {"q": q, "location": location_str, "radius_m": DEFAULT_NEAR_ME_RADIUS_M}
+                log_search(user, q_payload, len(df))
+        except Exception as e:
+            st.error(f"Search failed: {e}")
+
+    st.markdown("---")
+
+    # History viewer (requires login)
+    if user:
+        _history_ui(user)
+    else:
+        st.info("Sign in (sidebar) to enable history and CSV export of your searches.")
+
 
 if __name__ == "__main__":
     main()
