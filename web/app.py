@@ -26,6 +26,7 @@ PAGE_SLEEP_SECS = float(os.getenv("RVP_PAGE_SLEEP", "2.2"))
 
 PAGE_SIZE_HISTORY = 20        # rows per history page
 SEARCH_HARD_CAP     = 100     # maximum parks per search (server-side enforcement)
+PAD_HTTP_TIMEOUT = float(os.getenv("RVP_PAD_HTTP_TIMEOUT", "5.0"))  # seconds (was 7)
 
 # Cookie security (True on HTTPS like Streamlit Cloud; False for localhost dev)
 COOKIE_SECURE   = os.getenv("RVP_COOKIE_SECURE", "false").strip().lower() == "true"
@@ -289,7 +290,7 @@ def _generate_for_user(
 ) -> List[Dict[str, Any]]:
     sb = get_client()
 
-    # fetch existing place_ids for this user (case-insensitive)
+    # Track seen/already-added place_ids to avoid dupes for the user
     try:
         already_rows = (
             sb.table("history").select("park_place_id").ilike("email", email).execute().data or []
@@ -345,9 +346,11 @@ def _generate_for_user(
             if avoid_conglomerates and c._is_conglomerate(name, website):
                 return None
 
+            # Use the tunable timeout to speed up slow sites
             try:
-                no_booking, booking_hit, pad_count = c.check_booking_and_pads(website, timeout_sec=7)
+                no_booking, booking_hit, pad_count = c.check_booking_and_pads(website, timeout_sec=PAD_HTTP_TIMEOUT)
             except TypeError:
+                # older signature (no timeout)
                 no_booking, booking_hit, pad_count = c.check_booking_and_pads(website)
 
             if not (no_booking and (pad_count is None or pad_count >= c.PAD_MIN)):
@@ -424,6 +427,7 @@ def _generate_for_user(
             if not token or len(found) >= requested:
                 break
 
+            # Google requires ~2s before next_page_token is valid; make tunable
             time.sleep(PAGE_SLEEP_SECS)
 
     emit(f"[info] Completed. Found {len(found)} new parks.")
@@ -496,6 +500,7 @@ def _render_responsive_table(df: pd.DataFrame, order: list[str], labels: dict[st
         tds = []
         for c in df.columns:
             val = "" if pd.isna(row[c]) else str(row[c])
+            # Note: we intentionally DO NOT escape HTML here so <a> links render.
             tds.append(f'<td data-label="{labels.get(c,c)}">{val}</td>')
         rows_html.append(f"<tr>{''.join(tds)}</tr>")
     html = f"""
@@ -623,9 +628,6 @@ def main():
     st.divider()
 
     # -------------------------------------------------------------------------
-    # 📜 View My Search History (responsive + clickable + bottom pagination)
-    # -------------------------------------------------------------------------
-    # -------------------------------------------------------------------------
     # 📜 View My Search History (responsive + real links + centered pager only)
     # -------------------------------------------------------------------------
     with st.expander("📜 View My Search History", expanded=False):
@@ -685,17 +687,22 @@ def main():
 
                 _render_responsive_table(df_hist, order, labels)
 
-                # Bottom controls: ONLY the centered page number (with - / +).
+                # Bottom controls: compact centered pager ([-] Page N [+]) with correct directions
                 st.divider()
-                center = st.columns([1, 2, 1])[1]
-                with center:
-                    new_page = st.number_input(
-                        "Page", min_value=1, step=1, value=page,
-                        key="__hist_page_input_bottom", label_visibility="collapsed"
-                    )
-                    # allow any number; the fetch above will naturally clamp on next render
-                    if int(new_page) != page:
-                        st.session_state["__hist_page"] = int(new_page)
+                left, middle, right = st.columns([1, 2, 1])
+                with middle:
+                    bcol1, bcol2, bcol3 = st.columns([1, 2, 1])
+
+                    prev_clicked = bcol1.button("−", key="hist_page_minus", use_container_width=True, disabled=(page <= 1))
+                    # read-only page label (keeps state stable across reruns)
+                    bcol2.markdown(f"<div style='text-align:center;padding:6px 0'>Page <strong>{page}</strong></div>", unsafe_allow_html=True)
+                    next_clicked = bcol3.button("+", key="hist_page_plus", use_container_width=True, disabled=(not has_next))
+
+                # Apply clicks AFTER layout so Streamlit doesn't fight the widget state
+                if prev_clicked and page > 1:
+                    st.session_state["__hist_page"] = page - 1
+                if next_clicked and has_next:
+                    st.session_state["__hist_page"] = page + 1
 
                 # CSV (all history)
                 try:
