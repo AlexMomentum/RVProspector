@@ -1,3 +1,4 @@
+
 # web/app.py
 from __future__ import annotations
 
@@ -290,12 +291,14 @@ def _generate_for_user(
 ) -> List[Dict[str, Any]]:
     sb = get_client()
 
-    # fetch existing place_ids for this user (case-insensitive)
+    # Track seen/already-added place_ids to avoid dupes for the user
     try:
-        no_booking, booking_hit, pad_count = c.check_booking_and_pads(website, timeout_sec=PAD_HTTP_TIMEOUT)
-    except TypeError:
-        no_booking, booking_hit, pad_count = c.check_booking_and_pads(website)
-
+        already_rows = (
+            sb.table("history").select("park_place_id").ilike("email", email).execute().data or []
+        )
+        already = {row.get("park_place_id") for row in already_rows if row.get("park_place_id")}
+    except Exception:
+        already = set()
 
     seen: set[str] = set()
     found: List[Dict[str, Any]] = []
@@ -344,9 +347,11 @@ def _generate_for_user(
             if avoid_conglomerates and c._is_conglomerate(name, website):
                 return None
 
+            # Use the tunable timeout to speed up slow sites
             try:
-                no_booking, booking_hit, pad_count = c.check_booking_and_pads(website, timeout_sec=7)
+                no_booking, booking_hit, pad_count = c.check_booking_and_pads(website, timeout_sec=PAD_HTTP_TIMEOUT)
             except TypeError:
+                # older signature (no timeout)
                 no_booking, booking_hit, pad_count = c.check_booking_and_pads(website)
 
             if not (no_booking and (pad_count is None or pad_count >= c.PAD_MIN)):
@@ -423,6 +428,7 @@ def _generate_for_user(
             if not token or len(found) >= requested:
                 break
 
+            # Google requires ~2s before next_page_token is valid; make tunable
             time.sleep(PAGE_SLEEP_SECS)
 
     emit(f"[info] Completed. Found {len(found)} new parks.")
@@ -495,6 +501,7 @@ def _render_responsive_table(df: pd.DataFrame, order: list[str], labels: dict[st
         tds = []
         for c in df.columns:
             val = "" if pd.isna(row[c]) else str(row[c])
+            # Note: we intentionally DO NOT escape HTML here so <a> links render.
             tds.append(f'<td data-label="{labels.get(c,c)}">{val}</td>')
         rows_html.append(f"<tr>{''.join(tds)}</tr>")
     html = f"""
@@ -622,9 +629,6 @@ def main():
     st.divider()
 
     # -------------------------------------------------------------------------
-    # 📜 View My Search History (responsive + clickable + bottom pagination)
-    # -------------------------------------------------------------------------
-    # -------------------------------------------------------------------------
     # 📜 View My Search History (responsive + real links + centered pager only)
     # -------------------------------------------------------------------------
     with st.expander("📜 View My Search History", expanded=False):
@@ -700,10 +704,6 @@ def main():
                     st.session_state["__hist_page"] = page - 1
                 if next_clicked and has_next:
                     st.session_state["__hist_page"] = page + 1
-
-                    # allow any number; the fetch above will naturally clamp on next render
-                    if int(new_page) != page:
-                        st.session_state["__hist_page"] = int(new_page)
 
                 # CSV (all history)
                 try:
