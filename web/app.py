@@ -27,8 +27,8 @@ PAGE_SLEEP_SECS = float(os.getenv("RVP_PAGE_SLEEP", "2.2"))
 PAGE_SIZE_HISTORY = 20        # rows per history page
 SEARCH_HARD_CAP     = 100     # maximum parks per search (server-side enforcement)
 
-# Cookie security (use True on Streamlit Cloud / HTTPS, False for localhost dev)
-COOKIE_SECURE = os.getenv("RVP_COOKIE_SECURE", "false").strip().lower() == "true"
+# Cookie security (True on HTTPS like Streamlit Cloud; False for localhost dev)
+COOKIE_SECURE   = os.getenv("RVP_COOKIE_SECURE", "false").strip().lower() == "true"
 COOKIE_SAMESITE = os.getenv("RVP_COOKIE_SAMESITE", "Lax")
 
 # =============================================================================
@@ -167,17 +167,19 @@ else:
     st.sidebar.caption("Set DONATE_URL to show a donate button.")
 
 # =============================================================================
-# Cookie + session helpers (persistent + dev/prod aware)
+# COOKIE + URL HELPERS (single source of truth)
 # =============================================================================
 def _cm_set(cm: stx.CookieManager, key: str, value: str):
     expires_at = datetime.utcnow() + timedelta(days=180)
     try:
-        cm.set(key, value, expires_at=expires_at, key=key, path="/", secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE)
+        cm.set(key, value, expires_at=expires_at, key=key, path="/",
+               secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE)
         return
     except TypeError:
         pass
     try:
-        cm.set(key, value, expiry_days=180, key=key, path="/", secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE)
+        cm.set(key, value, expiry_days=180, key=key, path="/",
+               secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE)
         return
     except TypeError:
         pass
@@ -190,7 +192,7 @@ def _cm_delete(cm: stx.CookieManager, key: str):
         try:
             cm.delete(key)
         except Exception:
-            _cm_set(cm, key, "")
+            _cm_set(cm, key, "")  # overwrite if delete unsupported
 
 def _ensure_guest_cookie(cm: stx.CookieManager, cookies: Dict[str, str]) -> str:
     gid = cookies.get("rvp_guest_id")
@@ -204,8 +206,28 @@ def _set_signed_in(cm: stx.CookieManager, email: str, unlocked: bool):
     st.session_state["unlocked"] = bool(unlocked)
     _cm_set(cm, "rvp_email", email)
 
+def _set_url_email(email: str):
+    """Mirror the email in the URL so refresh can restore even if cookie lags."""
+    try:
+        st.query_params.update({"u": email})           # Streamlit >= 1.31
+    except Exception:
+        st.experimental_set_query_params(u=email)      # older versions
+
+def _get_url_email() -> str | None:
+    """Read mirrored email from URL (?u=...)"""
+    try:
+        qp = st.query_params
+        return qp.get("u")
+    except Exception:
+        qp = st.experimental_get_query_params()
+        return qp.get("u", [None])[0]
+
 def _sign_out(cm: stx.CookieManager):
     _cm_delete(cm, "rvp_email")
+    try:
+        st.query_params.update({"u": ""})
+    except Exception:
+        st.experimental_set_query_params(u="")
     st.session_state.clear()
     st.rerun()
 
@@ -463,11 +485,54 @@ def show_demo_limit(sb, cm):
         _dlg()
 
 # =============================================================================
+# Responsive table helper
+# =============================================================================
+def _render_responsive_table(df: pd.DataFrame, order: list[str], labels: dict[str, str]) -> None:
+    df = df[[c for c in order if c in df.columns]].copy()
+    # HTML table with data-labels for mobile
+    thead = "".join(f"<th>{labels.get(c,c)}</th>" for c in df.columns)
+    rows_html = []
+    for _, row in df.iterrows():
+        tds = []
+        for c in df.columns:
+            val = "" if pd.isna(row[c]) else str(row[c])
+            tds.append(f'<td data-label="{labels.get(c,c)}">{val}</td>')
+        rows_html.append(f"<tr>{''.join(tds)}</tr>")
+    html = f"""
+    <table class="rvp-table">
+      <thead><tr>{thead}</tr></thead>
+      <tbody>{''.join(rows_html)}</tbody>
+    </table>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+
+# =============================================================================
 # App
 # =============================================================================
 def main():
     st.markdown("<h1>🗺️ RV Prospector</h1>", unsafe_allow_html=True)
     st.caption("Find RV parks without online booking — Demo gives you 10 new leads per day.")
+
+    # ---- responsive table CSS (desktop -> mobile cards) ----
+    st.markdown("""
+    <style>
+    .rvp-table { width:100%; border-collapse: collapse; }
+    .rvp-table th, .rvp-table td { padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.08); vertical-align: top; }
+    .rvp-table th { text-align: left; font-weight: 600; }
+    .rvp-table td a { text-decoration: underline; }
+    @media (max-width: 760px) {
+      .rvp-table thead { display: none; }
+      .rvp-table, .rvp-table tbody, .rvp-table tr, .rvp-table td { display: block; width: 100%; }
+      .rvp-table tr { margin: 0 0 12px 0; padding: 12px; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; }
+      .rvp-table td { border: none; padding: 4px 0; }
+      .rvp-table td::before {
+         content: attr(data-label);
+         display: block;
+         font-size: 12px; opacity: .7; margin-bottom: 2px;
+      }
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
     cm = stx.CookieManager(key="rvp_cookies")
     sb = get_client()
@@ -477,16 +542,19 @@ def main():
     if cookies is None:
         st.stop()
 
-    # Initialize identity
+    # ---------- Identity init (cookie OR URL param) ----------
     if "user_key" not in st.session_state:
         saved_email = cookies.get("rvp_email")
+        if not saved_email:
+            saved_email = _get_url_email()
+
         if saved_email:
             prior = bool(st.session_state.get("unlocked"))
             try:
                 unlocked_db = bool(is_unlocked(sb, saved_email))
             except Exception:
                 unlocked_db = False
-            _set_signed_in(cm, saved_email, prior or unlocked_db)
+            _set_signed_in(cm, saved_email, prior or unlocked_db)  # set cookie + session
         else:
             st.session_state["user_key"] = _ensure_guest_cookie(cm, cookies)
             st.session_state["unlocked"] = False
@@ -506,6 +574,7 @@ def main():
                     upsert_profile(get_client(), email, full_name or None)
                     unlocked_now = bool(is_unlocked(get_client(), email))
                     _set_signed_in(cm, email, unlocked_now)
+                    _set_url_email(email)  # mirror to URL for refresh fallback
                     st.success(f"✅ Signed in as {email} ({'Unlimited' if unlocked_now else 'Demo user'})")
                     st.rerun()
                 except Exception as e:
@@ -536,6 +605,7 @@ def main():
                                 {"email": user_email, "unlocked": True}
                             ).execute()
                         _set_signed_in(cm, user_email, True)
+                        _set_url_email(user_email)
                         st.success("Unlimited activated for your account.")
                         st.rerun()
                     except Exception as e:
@@ -552,27 +622,22 @@ def main():
 
     st.divider()
 
-    # =========================================================================
-    # 📜 View My Search History + CSV (clickable + pagination without jarring reruns)
-    # =========================================================================
+    # -------------------------------------------------------------------------
+    # 📜 View My Search History (responsive + clickable + bottom pagination)
+    # -------------------------------------------------------------------------
     with st.expander("📜 View My Search History", expanded=False):
         user_key = str(st.session_state.get("user_key", "")) or ""
         if not user_key:
             st.info("Sign in or continue as guest to build your history.")
         else:
-            # 1-based page index
-            st.session_state.setdefault("__hist_page", 1)
+            st.session_state.setdefault("__hist_page", 1)  # 1-based
             page = st.session_state["__hist_page"]
-
-            # Fetch PAGE_SIZE+1 to know if a "next" page exists without a second query
             offset = (page - 1) * PAGE_SIZE_HISTORY
+
+            # Fetch PAGE_SIZE+1 to know if a next page exists
             rows_plus = []
             try:
-                rows_plus = list_history_rows(
-                    get_client(), user_key,
-                    limit=PAGE_SIZE_HISTORY + 1,
-                    offset=offset
-                )
+                rows_plus = list_history_rows(get_client(), user_key, limit=PAGE_SIZE_HISTORY + 1, offset=offset)
             except Exception as e:
                 st.error(f"Could not load history: {e}")
 
@@ -587,32 +652,32 @@ def main():
             else:
                 df_hist = pd.DataFrame(rows)
 
-                # clickable park names
+                # Clickable park names
                 if {"park_name", "website"}.issubset(df_hist.columns):
                     df_hist["park_name"] = df_hist.apply(
                         lambda x: f"[{x['park_name']}]({x['website']})" if x.get("website") else x["park_name"],
                         axis=1,
                     )
 
-                nice_cols = [
-                    "created_at", "park_name", "phone",
-                    "address", "city", "state", "zip",
-                    "pad_count", "source"
-                ]
-                existing = [c for c in nice_cols if c in df_hist.columns]
-                df_view = df_hist[existing].copy()
+                # Columns to show (no pad_count or source)
+                order = ["created_at", "park_name", "phone", "address", "city", "state", "zip"]
+                labels = {
+                    "created_at": "Date",
+                    "park_name": "Park",
+                    "phone": "Phone",
+                    "address": "Address",
+                    "city": "City",
+                    "state": "State",
+                    "zip": "ZIP",
+                }
 
-                if "created_at" in df_view.columns:
+                if "created_at" in df_hist.columns:
                     try:
-                        df_view["created_at"] = pd.to_datetime(df_view["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
+                        df_hist["created_at"] = pd.to_datetime(df_hist["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
                     except Exception:
                         pass
 
-                # Table
-                try:
-                    st.markdown(df_view.to_markdown(index=False), unsafe_allow_html=True)
-                except Exception:
-                    st.dataframe(df_view, use_container_width=True, hide_index=True)
+                _render_responsive_table(df_hist, order, labels)
 
                 # Bottom controls
                 st.divider()
@@ -621,15 +686,10 @@ def main():
                     if st.button("◀ Prev", key="hist_prev_bottom", use_container_width=True, disabled=not has_prev):
                         st.session_state["__hist_page"] = max(1, page - 1)
                 with c2:
-                    # center the page input without label noise
                     st.write("")  # spacer
                     new_page = st.number_input(
-                        "Page",
-                        min_value=1,
-                        step=1,
-                        value=page,
-                        key="__hist_page_input_bottom",
-                        label_visibility="collapsed"
+                        "Page", min_value=1, step=1, value=page,
+                        key="__hist_page_input_bottom", label_visibility="collapsed"
                     )
                     if new_page != page:
                         st.session_state["__hist_page"] = int(new_page)
@@ -709,7 +769,8 @@ def main():
                 lambda x: f"[{x['park_name']}]({x['website']})" if x["website"] else x["park_name"],
                 axis=1,
             )
-        show_cols = ["park_name", "phone", "address", "city", "state", "zip", "pad_count", "source"]
+        # Hide pad_count/source in Results, too
+        show_cols = ["park_name", "phone", "address", "city", "state", "zip"]
         show_cols = [c for c in show_cols if c in df.columns]
         df = df[show_cols].copy()
         df.insert(0, "#", range(1, len(df) + 1))
